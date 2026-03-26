@@ -250,7 +250,7 @@ pub const Renderer = struct {
         var ctx: ?*c.ID3D11DeviceContext = null;
         var fl: u32 = 0;
 
-        var flags: c.UINT = 0;
+        var flags: c.UINT = c.D3D11_CREATE_DEVICE_BGRA_SUPPORT; // Required for D2D interop
         const is_debug = (@import("builtin").mode == .Debug);
         if (is_debug) flags |= c.D3D11_CREATE_DEVICE_DEBUG;
 
