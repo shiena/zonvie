@@ -2122,6 +2122,15 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 // ============================================================
                 // PHASE 1: Start nvim spawn FIRST (runs in parallel with renderer init)
+                //
+                // Start-up sequence:
+                //   1a. DWrite initMetrics (~2ms)  → cellW/H
+                //   1b. nvim spawn (async, ~57ms) with correct size → 30ms earlier
+                //   1c. DWrite initRenderTarget (~3ms): D2D init, while nvim spawns
+                //   1d. D3D11 init (~44ms) after DWrite render target
+                //
+                //   nvim_ui_attach carries the correct size (computed from cell metrics directly),
+                //   so Neovim renders at the correct size the first time (no double-render).
                 // ============================================================
                 var cb: core.Callbacks = .{
                     .on_vertices_partial = callbacks.onVerticesPartial,
@@ -2242,9 +2251,13 @@ pub export fn WndProc(
                 core.zonvie_core_set_atlas_size(app.corep, atlas_size_clamped);
                 if (deferred_log_enabled) applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
 
-                // ============================================================
-                // PHASE 1.5: Initialize DWrite metrics FIRST (cell size needed for correct rows/cols)
-                // ============================================================
+                // PHASE 1a: DWrite metrics only (~2ms, no render target).
+                // D2D1 factory + TextFormat + recomputeCellMetrics → cellW/H.
+                // CreateHwndRenderTarget (~30ms) is deferred to after nvim spawn.
+                if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
+
+                // 1) Atlas builder (DirectWrite + CPU atlas)
+                // Font priority: config.font.family > OS default (Consolas)
                 const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
                 const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
                 if (deferred_log_enabled) applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
@@ -2253,22 +2266,23 @@ pub export fn WndProc(
                 var atlas = dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
                     if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initMetrics failed: {any}\n", .{e});
                     app.atlas = null;
-                    app.renderer = null;
                     return 0;
                 };
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
-                    const metrics_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.initMetrics: {d}ms", .{metrics_ms});
+                    const dwrite_metrics_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.initMetrics: {d}ms", .{dwrite_metrics_ms});
                 }
 
-                // Set initial DPI scale and cell metrics from DWrite
+                // Set initial DPI scale from renderer
                 app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
+                if (deferred_log_enabled) applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
+
+                // Extract cell metrics from DWrite so rows/cols can be computed before nvim starts.
                 app.cell_w_px = atlas.cellW();
                 app.cell_h_px = atlas.cellH();
-                if (deferred_log_enabled) applog.appLog("[win] metrics ready: dpi_scale={d:.2} cell={d}x{d}\n", .{ app.dpi_scale, app.cell_w_px, app.cell_h_px });
 
-                // Calculate correct rows/cols from window size and cell metrics
+                // Compute correct rows/cols from actual cell metrics and window size.
                 updateRowsColsFromClientForce(hwnd, app);
 
                 // Build nvim command and start nvim (runs in background thread)
