@@ -434,6 +434,15 @@ pub const Core = struct {
     init_rows: u32 = 24,
     init_cols: u32 = 80,
 
+    // Synchronization for delaying nvim_ui_attach until actual layout is known.
+    // The RPC thread waits on ui_attach_cond before sending nvim_ui_attach.
+    // Call notifyLayoutReady() from the UI thread after renderer init.
+    ui_attach_mutex: std.Thread.Mutex = .{},
+    ui_attach_cond: std.Thread.Condition = .{},
+    ui_attach_ready: bool = false,
+    ui_attach_rows: u32 = 0,
+    ui_attach_cols: u32 = 0,
+
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
     pending_resize_rows: u32 = 0,
@@ -685,8 +694,44 @@ pub const Core = struct {
         self.started = true;
     }
 
+    /// Signal the RPC thread that the actual layout is known and nvim_ui_attach
+    /// can be sent with the correct dimensions. Must be called from the UI
+    /// thread after the renderer is initialized and actual rows/cols are computed.
+    /// Idempotent: subsequent calls after the first are no-ops.
+    pub fn notifyLayoutReady(self: *Core, rows: u32, cols: u32) void {
+        self.ui_attach_mutex.lock();
+        defer self.ui_attach_mutex.unlock();
+        if (self.ui_attach_ready) return;
+        self.ui_attach_rows = rows;
+        self.ui_attach_cols = cols;
+        // Pre-set last_layout to suppress a redundant resize after attach.
+        self.last_layout_rows = rows;
+        self.last_layout_cols = cols;
+        self.ui_attach_ready = true;
+        self.ui_attach_cond.signal();
+        self.log.write("notifyLayoutReady: rows={d} cols={d}\n", .{ rows, cols });
+    }
+
+    /// Block until notifyLayoutReady() is called or stop is requested.
+    /// Called from the RPC thread before nvim_ui_attach.
+    pub fn waitForLayoutReady(self: *Core) void {
+        self.ui_attach_mutex.lock();
+        defer self.ui_attach_mutex.unlock();
+        while (!self.ui_attach_ready and !self.stop_flag.load(.seq_cst)) {
+            self.ui_attach_cond.timedWait(&self.ui_attach_mutex, 100 * std.time.ns_per_ms) catch {};
+        }
+        if (self.ui_attach_ready) {
+            self.log.write("waitForLayoutReady: ready (rows={d}, cols={d})\n", .{ self.ui_attach_rows, self.ui_attach_cols });
+        } else {
+            self.log.write("waitForLayoutReady: aborted (stop requested)\n", .{});
+        }
+    }
+
     pub fn stop(self: *Core) void {
         self.stop_flag.store(true, .seq_cst);
+
+        // Wake up layout-ready waiter so RPC thread can exit
+        self.ui_attach_cond.signal();
 
         // Signal writer thread to stop and capture thread handle under lock
         var wt: ?std.Thread = null;

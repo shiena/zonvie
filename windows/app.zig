@@ -28,6 +28,7 @@ pub const zonvie_core_create = core.zonvie_core_create;
 pub const zonvie_core_destroy = core.zonvie_core_destroy;
 pub const zonvie_core_start = core.zonvie_core_start;
 pub const zonvie_core_stop = core.zonvie_core_stop;
+pub const zonvie_core_notify_layout_ready = core.zonvie_core_notify_layout_ready;
 pub const zonvie_core_send_input = core.zonvie_core_send_input;
 pub const zonvie_core_send_key_event = core.zonvie_core_send_key_event;
 pub const zonvie_core_resize = core.zonvie_core_resize;

@@ -2057,13 +2057,19 @@ pub export fn WndProc(
                                 nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
-                                // Start nvim
+                                // Start nvim with correct rows/cols
+                                const dc_rows: u32 = if (app.surface.rows > 0) app.surface.rows else 24;
+                                const dc_cols: u32 = if (app.surface.cols > 0) app.surface.cols else 80;
                                 const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                                 defer if (nvim_path_z) |p| app.alloc.free(p);
                                 const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                                if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec\n", .{});
-                                const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
+                                if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec rows={d} cols={d}\n", .{ dc_rows, dc_cols });
+                                const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, dc_rows, dc_cols);
                                 if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
+
+                                // Signal layout ready so RPC thread proceeds with correct size
+                                updateLayoutToCore(hwnd, app);
+                                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
@@ -2239,6 +2245,35 @@ pub export fn WndProc(
                 core.zonvie_core_set_atlas_size(app.corep, atlas_size_clamped);
                 if (deferred_log_enabled) applog.appLog("[win] set atlas_size={d}\n", .{atlas_size_clamped});
 
+                // ============================================================
+                // PHASE 1.5: Initialize DWrite metrics FIRST (cell size needed for correct rows/cols)
+                // ============================================================
+                const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
+                const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
+                if (deferred_log_enabled) applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
+
+                if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
+                var atlas = dwrite_d2d.Renderer.initMetrics(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
+                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initMetrics failed: {any}\n", .{e});
+                    app.atlas = null;
+                    app.renderer = null;
+                    return 0;
+                };
+                if (deferred_log_enabled) {
+                    _ = c.QueryPerformanceCounter(&t2);
+                    const metrics_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.initMetrics: {d}ms", .{metrics_ms});
+                }
+
+                // Set initial DPI scale and cell metrics from DWrite
+                app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
+                app.cell_w_px = atlas.cellW();
+                app.cell_h_px = atlas.cellH();
+                if (deferred_log_enabled) applog.appLog("[win] metrics ready: dpi_scale={d:.2} cell={d}x{d}\n", .{ app.dpi_scale, app.cell_w_px, app.cell_h_px });
+
+                // Calculate correct rows/cols from window size and cell metrics
+                updateRowsColsFromClientForce(hwnd, app);
+
                 // Build nvim command and start nvim (runs in background thread)
                 var nvim_cmd_buf: [1024]u8 = undefined;
                 var nvim_cmd_slice: []const u8 = undefined;
@@ -2404,18 +2439,28 @@ pub export fn WndProc(
 
                 // Skip nvim startup if waiting for devcontainer up
                 if (!app.devcontainer_up_pending) {
+                    // Use correct rows/cols from cell metrics (not hardcoded 24x80)
+                    const start_rows: u32 = if (app.surface.rows > 0) app.surface.rows else 24;
+                    const start_cols: u32 = if (app.surface.cols > 0) app.surface.cols else 80;
+
                     const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                     defer if (nvim_path_z) |p| app.alloc.free(p);
                     const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s}\n", .{nvim_cmd_slice});
+                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s} rows={d} cols={d}\n", .{ nvim_cmd_slice, start_rows, start_cols });
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
+                    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, start_rows, start_cols);
                     if (deferred_log_enabled) {
                         _ = c.QueryPerformanceCounter(&t2);
                         const core_start_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
                         applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
                         applog.appLog("  core_start -> {d}", .{start_ok});
                     }
+
+                    // Notify layout with correct pixel dimensions, then signal layout ready.
+                    // This unblocks the RPC thread which is waiting before nvim_ui_attach.
+                    updateLayoutToCore(hwnd, app);
+                    core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
+                    if (deferred_log_enabled) applog.appLog("[win] layout ready signaled\n", .{});
 
                     // Close devcontainer progress dialog if shown (for non-rebuild mode)
                     if (app.devcontainer_mode and !app.devcontainer_rebuild) {
@@ -2426,34 +2471,27 @@ pub export fn WndProc(
                 }
 
                 // ============================================================
-                // PHASE 2: Initialize renderers (runs in parallel with nvim spawn)
+                // PHASE 2: Complete renderer initialization (D2D render target + D3D11)
+                // Runs after nvim spawn is kicked off, in parallel with nvim startup.
                 // ============================================================
-                if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
+                if (deferred_log_enabled) applog.appLog("  renderer phase 2 (render targets)...", .{});
 
-                // 1) Atlas builder (DirectWrite + CPU atlas)
-                // Font priority: config.font.family > OS default (Consolas)
-                const initial_font = if (app.config.font.family.len > 0) app.config.font.family else "Consolas";
-                const initial_pt: f32 = if (app.config.font.size > 0.0) app.config.font.size else 14.0;
-                if (deferred_log_enabled) applog.appLog("[win] initial font: '{s}' pt={d}\n", .{ initial_font, initial_pt });
-
+                // Complete DWrite/D2D renderer: create D2D factory + render target
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                const atlas = dwrite_d2d.Renderer.init(app.alloc, hwnd, initial_font, initial_pt) catch |e| {
-                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.init failed: {any}\n", .{e});
+                atlas.initRenderTarget() catch |e| {
+                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initRenderTarget failed: {any}\n", .{e});
+                    atlas.deinit();
                     app.atlas = null;
                     app.renderer = null;
                     return 0;
                 };
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
-                    const dwrite_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.init: {d}ms", .{dwrite_ms});
+                    const rt_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
+                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.initRenderTarget: {d}ms", .{rt_ms});
                 }
 
-                // Set initial DPI scale from renderer
-                app.dpi_scale = @as(f32, @floatFromInt(atlas.dpi)) / 96.0;
-                if (deferred_log_enabled) applog.appLog("[win] initial dpi_scale={d:.2}\n", .{app.dpi_scale});
-
-                // 2) GPU renderer (D3D11)
+                // GPU renderer (D3D11)
                 // When ext_tabline is enabled, use content child window for D3D11 rendering
                 const render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
                     app.content_hwnd.?
@@ -2464,8 +2502,7 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
                     if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
-                    var tmp = atlas;
-                    tmp.deinit(); // avoid leak
+                    atlas.deinit();
                     app.atlas = null;
                     app.renderer = null;
                     return 0;
@@ -2482,11 +2519,6 @@ pub export fn WndProc(
                 app.mu.unlock();
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
-
-                if (app.atlas) |*a| {
-                    app.cell_w_px = a.cellW();
-                    app.cell_h_px = a.cellH();
-                }
 
                 // Process pending glyphs that were requested before atlas was ready
                 // (happens when nvim spawn runs in parallel with renderer init)
@@ -2511,14 +2543,6 @@ pub export fn WndProc(
                         app.pending_glyphs.clearRetainingCapacity();
                     }
                 }
-
-                // NOTE: setFontUtf8("Consolas", 14.0) is already called in dwrite_d2d.Renderer.init()
-                // Removed redundant call to avoid double font initialization (~10ms savings)
-
-                updateRowsColsFromClientForce(hwnd, app);
-
-                // Update layout after renderer is ready
-                updateLayoutToCore(hwnd, app);
 
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
