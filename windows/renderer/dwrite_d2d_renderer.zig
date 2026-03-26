@@ -145,9 +145,9 @@ pub const Renderer = struct {
     // Invalidated on font/DPI/device changes.
     gsub_cache: [4]GsubCacheEntry = [_]GsubCacheEntry{.{}} ** 4,
 
-    /// Phase 1: Initialize DWrite factory, DPI, and font metrics.
-    /// After this call, cellW()/cellH() return valid cell dimensions.
-    /// Does NOT create D2D factory or render target (deferred to initRenderTarget).
+    /// Phase 1 of two-phase init: creates D2D/DWrite factories, sets font, and
+    /// computes cellW/cellH. Does NOT create the D2D render target (~30ms).
+    /// Call initRenderTarget() to complete initialization before rendering.
     pub fn initMetrics(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
@@ -165,7 +165,24 @@ pub const Renderer = struct {
             self.styled_glyph_map.deinit();
         }
 
-        // DWrite factory (needed for font metrics)
+        // D2D factory
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
+        var d2d_factory: ?*c.ID2D1Factory = null;
+        const hr_d2d = c.D2D1CreateFactory(
+            c.D2D1_FACTORY_TYPE_MULTI_THREADED,
+            &c.IID_ID2D1Factory,
+            null,
+            @ptrCast(&d2d_factory),
+        );
+        if (hr_d2d != 0 or d2d_factory == null) return error.D2DFactoryCreateFailed;
+        self.d2d_factory = d2d_factory;
+        errdefer safeRelease(self.d2d_factory);
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
+
+        // DWrite factory
         if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         var dw_factory: ?*c.IDWriteFactory = null;
         const hr_dw = c.DWriteCreateFactory(
@@ -200,47 +217,27 @@ pub const Renderer = struct {
         return self;
     }
 
-    /// Phase 2: Create D2D factory and HWND render target.
-    /// Must be called after initMetrics() to complete renderer initialization.
+    /// Phase 2 of two-phase init: creates the D2D HwndRenderTarget and atlas
+    /// resources. Must be called before any rendering operations.
     pub fn initRenderTarget(self: *Renderer) !void {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
         if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
 
-        // D2D factory
-        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
-        var d2d_factory: ?*c.ID2D1Factory = null;
-        const hr_d2d = c.D2D1CreateFactory(
-            c.D2D1_FACTORY_TYPE_MULTI_THREADED,
-            &c.IID_ID2D1Factory,
-            null,
-            @ptrCast(&d2d_factory),
-        );
-        if (hr_d2d != 0 or d2d_factory == null) return error.D2DFactoryCreateFailed;
-        self.d2d_factory = d2d_factory;
-        if (applog.isEnabled()) {
-            _ = c.QueryPerformanceCounter(&t1);
-            applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
-        }
-
         // Create render target for hwnd
         if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         try self.recreateRenderTarget();
         if (applog.isEnabled()) {
             _ = c.QueryPerformanceCounter(&t1);
-            applog.appLog("[d2d] [TIMING] recreateRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+            applog.appLog("[d2d] [TIMING] initRenderTarget: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
         }
     }
 
-    /// Full initialization (both phases). Preserves existing callers.
+    /// Full single-phase init (for callers that do not need the two-phase split).
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, initial_font: []const u8, initial_pt: f32) !Renderer {
         var self = try initMetrics(alloc, hwnd, initial_font, initial_pt);
-        errdefer {
-            self.glyph_map.deinit();
-            self.styled_glyph_map.deinit();
-            safeRelease(self.dwrite_factory);
-        }
+        errdefer self.deinit();
         try self.initRenderTarget();
         return self;
     }

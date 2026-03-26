@@ -1274,23 +1274,11 @@ pub fn runLoop(self: *Core) void {
 
     var ui_attached = false;
 
-    // Wait for frontend to signal that layout (cell metrics + drawable size) is ready.
-    // This ensures nvim_ui_attach sends the correct rows/cols from the start,
-    // avoiding a redundant resize and double-draw on startup.
-    self.log.write("waiting for layout ready...\n", .{});
-    self.waitForLayoutReady();
-    if (self.stop_flag.load(.seq_cst)) {
-        self.log.write("layout wait aborted (stop requested)\n", .{});
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
-        return;
-    }
-
     self.requestGetApiInfo() catch |e| self.log.write("send get_api_info failed: {any}\n", .{e});
     self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
-    // init_rows/init_cols are pre-computed to the correct window size by the Windows
-    // frontend (initializes DWrite cell metrics) before calling zonvie_core_start().
-    // So the values passed here already reflect the actual terminal dimensions.
+    // init_rows/init_cols are pre-computed to the correct window size: the Windows
+    // frontend initializes DWrite cell metrics before calling zonvie_core_start(),
+    // so the values passed here already reflect the actual terminal dimensions.
     self.requestUiAttach(self.init_rows, self.init_cols) catch |e| {
         self.log.write("ui_attach send failed: {any}\n", .{e});
         _ = child.kill() catch {};

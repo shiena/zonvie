@@ -2057,18 +2057,15 @@ pub export fn WndProc(
                                 nvim_cmd_slice = nvim_cmd_buf[0..fbs.pos];
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
-                                // Start nvim with correct rows/cols
-                                const dc_rows: u32 = if (app.surface.rows > 0) app.surface.rows else 24;
-                                const dc_cols: u32 = if (app.surface.cols > 0) app.surface.cols else 80;
+                                // Start nvim
                                 const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                                 defer if (nvim_path_z) |p| app.alloc.free(p);
                                 const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                                if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec rows={d} cols={d}\n", .{ dc_rows, dc_cols });
-                                const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, dc_rows, dc_cols);
+                                if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec\n", .{});
+                                const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
                                 if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
 
-                                // Signal layout ready so RPC thread proceeds with correct size
-                                updateLayoutToCore(hwnd, app);
+                                // Renderer is already initialized at this point; notify with correct rows/cols.
                                 core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
 
                                 app.devcontainer_up_pending = false;
@@ -2437,30 +2434,24 @@ pub export fn WndProc(
                     }
                 }
 
-                // Skip nvim startup if waiting for devcontainer up
+                // PHASE 1b: Skip nvim startup if waiting for devcontainer up
                 if (!app.devcontainer_up_pending) {
-                    // Use correct rows/cols from cell metrics (not hardcoded 24x80)
-                    const start_rows: u32 = if (app.surface.rows > 0) app.surface.rows else 24;
-                    const start_cols: u32 = if (app.surface.cols > 0) app.surface.cols else 80;
-
+                    // Start nvim with the correct terminal size.
+                    // nvim_ui_attach carries the correct size directly, so Neovim
+                    // never renders at the wrong size. Starts ~30ms earlier than
+                    // before because CreateHwndRenderTarget is now deferred.
                     const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                     defer if (nvim_path_z) |p| app.alloc.free(p);
                     const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s} rows={d} cols={d}\n", .{ nvim_cmd_slice, start_rows, start_cols });
+                    if (deferred_log_enabled) applog.appLog("[win] starting neovim: path={s} rows={d} cols={d}\n", .{ nvim_cmd_slice, app.surface.rows, app.surface.cols });
                     if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, start_rows, start_cols);
+                    const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
                     if (deferred_log_enabled) {
                         _ = c.QueryPerformanceCounter(&t2);
                         const core_start_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
                         applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
                         applog.appLog("  core_start -> {d}", .{start_ok});
                     }
-
-                    // Notify layout with correct pixel dimensions, then signal layout ready.
-                    // This unblocks the RPC thread which is waiting before nvim_ui_attach.
-                    updateLayoutToCore(hwnd, app);
-                    core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
-                    if (deferred_log_enabled) applog.appLog("[win] layout ready signaled\n", .{});
 
                     // Close devcontainer progress dialog if shown (for non-rebuild mode)
                     if (app.devcontainer_mode and !app.devcontainer_rebuild) {
@@ -2471,12 +2462,13 @@ pub export fn WndProc(
                 }
 
                 // ============================================================
-                // PHASE 2: Complete renderer initialization (D2D render target + D3D11)
-                // Runs after nvim spawn is kicked off, in parallel with nvim startup.
+                // PHASE 2: Initialize renderers (runs in parallel with nvim spawn)
+                // PHASE 1c: Complete DWrite render target (~30ms).
+                // Runs while nvim spawns in the background (~57ms).
                 // ============================================================
-                if (deferred_log_enabled) applog.appLog("  renderer phase 2 (render targets)...", .{});
+                if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
 
-                // Complete DWrite/D2D renderer: create D2D factory + render target
+                // Complete DWrite/D2D renderer: create render target
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 atlas.initRenderTarget() catch |e| {
                     if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initRenderTarget failed: {any}\n", .{e});
@@ -2491,7 +2483,7 @@ pub export fn WndProc(
                     applog.appLog("  [TIMING] dwrite_d2d.Renderer.initRenderTarget: {d}ms", .{rt_ms});
                 }
 
-                // GPU renderer (D3D11)
+                // 2) GPU renderer (D3D11)
                 // When ext_tabline is enabled, use content child window for D3D11 rendering
                 const render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
                     app.content_hwnd.?
@@ -2543,6 +2535,16 @@ pub export fn WndProc(
                         app.pending_glyphs.clearRetainingCapacity();
                     }
                 }
+
+                // Update layout after renderer is ready.
+                updateRowsColsFromClientForce(hwnd, app);
+
+                // Update layout: should be a no-op since rows/cols were correct at nvim start.
+                updateLayoutToCore(hwnd, app);
+
+                // Notify core (idempotent): no RPC thread is waiting since we pre-compute correct size.
+                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
+                if (deferred_log_enabled) applog.appLog("[win] notified layout ready: rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
 
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
