@@ -631,8 +631,9 @@ pub fn main() u8 {
 
     if (applog.isEnabled()) applog.appLog("[win] opacity={d:.2}\n", .{opacity});
 
-    // Use WS_EX_NOREDIRECTIONBITMAP for DirectComposition-based transparency
-    const dwExStyle: c.DWORD = if (opacity < 1.0) c.WS_EX_NOREDIRECTIONBITMAP else 0;
+    // Always use WS_EX_NOREDIRECTIONBITMAP: DWM won't allocate a redirection surface.
+    // All rendering goes through DXGI swap chain + DirectComposition.
+    const dwExStyle: c.DWORD = c.WS_EX_NOREDIRECTIONBITMAP;
 
     // Custom D3D11 overlay scrollbar (no WS_VSCROLL)
     const window_style: c.DWORD = c.WS_OVERLAPPEDWINDOW | c.WS_VISIBLE;

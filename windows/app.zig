@@ -2350,6 +2350,10 @@ pub const App = struct {
     // Atlas builder (DirectWrite + CPU atlas, metrics)
     atlas: ?dwrite_d2d.Renderer = null,
 
+    // D3D11 device (created early in WM_CREATE for D2D context)
+    d3d_device: ?*c.ID3D11Device = null,
+    d3d_ctx: ?*c.ID3D11DeviceContext = null,
+
     // GPU renderer (D3D11)
     renderer: ?d3d11.Renderer = null,
 

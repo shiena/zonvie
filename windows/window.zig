@@ -337,6 +337,17 @@ pub export fn WndProc(
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
 
+                // Create D3D11 device early (no swap chain yet).
+                // The device is needed for D2D device context creation in DWrite renderer.
+                const d3d_result = d3d11.Renderer.createDeviceOnly() catch null;
+                if (d3d_result) |result| {
+                    app.d3d_device = result.device;
+                    app.d3d_ctx = result.ctx;
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: D3D11 device created early\n", .{});
+                } else {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CREATE: D3D11 device creation failed (will retry in deferred init)\n", .{});
+                }
+
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
 
@@ -2482,19 +2493,29 @@ pub export fn WndProc(
                 // ============================================================
                 if (deferred_log_enabled) applog.appLog("  renderer create...", .{});
 
-                // Complete DWrite/D2D renderer: create render target
+                // Complete DWrite/D2D: create D2D device context from D3D11 device.
+                // Falls back to HwndRenderTarget if ID2D1Factory1 not available.
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                atlas.initRenderTarget() catch |e| {
-                    if (deferred_log_enabled) applog.appLog("dwrite_d2d.Renderer.initRenderTarget failed: {any}\n", .{e});
+                if (app.d3d_device) |d3d_dev| {
+                    atlas.initD2DDeviceContext(d3d_dev) catch |e| {
+                        if (deferred_log_enabled) applog.appLog("dwrite_d2d initD2DDeviceContext failed: {any}, trying legacy\n", .{e});
+                        atlas.initRenderTarget() catch {};
+                    };
+                } else {
+                    atlas.initRenderTarget() catch {};
+                }
+                // Check we have at least one render path
+                if (atlas.d2d_device_ctx == null and atlas.rt == null) {
+                    if (deferred_log_enabled) applog.appLog("dwrite_d2d: no D2D render path available\n", .{});
                     atlas.deinit();
                     app.atlas = null;
                     app.renderer = null;
                     return 0;
-                };
+                }
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
                     const rt_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
-                    applog.appLog("  [TIMING] dwrite_d2d.Renderer.initRenderTarget: {d}ms", .{rt_ms});
+                    applog.appLog("  [TIMING] D2D context init: {d}ms", .{rt_ms});
                 }
 
                 // 2) GPU renderer (D3D11)
@@ -2506,12 +2527,23 @@ pub export fn WndProc(
                 if (deferred_log_enabled) applog.appLog("[win] D3D11 target hwnd: {s}\n", .{if (render_hwnd == hwnd) "main" else "content child"});
 
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
-                const gpu = d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
-                    if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
-                    atlas.deinit();
-                    app.atlas = null;
-                    app.renderer = null;
-                    return 0;
+                const gpu = blk: {
+                    if (app.d3d_device != null and app.d3d_ctx != null) {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                            if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
+                            atlas.deinit();
+                            app.atlas = null;
+                            app.renderer = null;
+                            return 0;
+                        };
+                    }
+                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
+                        if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
+                        atlas.deinit();
+                        app.atlas = null;
+                        app.renderer = null;
+                        return 0;
+                    };
                 };
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);

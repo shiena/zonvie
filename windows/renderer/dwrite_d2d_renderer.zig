@@ -45,7 +45,10 @@ pub const Renderer = struct {
     mu: std.Thread.Mutex = .{},
 
     d2d_factory: ?*c.ID2D1Factory = null,
-    rt: ?*c.ID2D1HwndRenderTarget = null,
+    d2d_factory1: ?*c.ID2D1Factory1 = null,
+    d2d_device: ?*c.ID2D1Device = null,
+    d2d_device_ctx: ?*c.ID2D1DeviceContext = null,
+    rt: ?*c.ID2D1HwndRenderTarget = null, // legacy, kept for fallback
 
     dwrite_factory: ?*c.IDWriteFactory = null,
     text_format: ?*c.IDWriteTextFormat = null,
@@ -177,6 +180,16 @@ pub const Renderer = struct {
         if (hr_d2d != 0 or d2d_factory == null) return error.D2DFactoryCreateFailed;
         self.d2d_factory = d2d_factory;
         errdefer safeRelease(self.d2d_factory);
+
+        // QueryInterface for ID2D1Factory1 (needed for D2D device context creation)
+        var factory1: ?*c.ID2D1Factory1 = null;
+        const fac_unk: *c.IUnknown = @ptrCast(d2d_factory.?);
+        if (fac_unk.lpVtbl.*.QueryInterface) |qi| {
+            _ = qi(fac_unk, &c.IID_ID2D1Factory1, @ptrCast(&factory1));
+        }
+        self.d2d_factory1 = factory1;
+        if (applog.isEnabled()) applog.appLog("[d2d] ID2D1Factory1: {s}\n", .{if (factory1 != null) "available" else "not available"});
+
         if (applog.isEnabled()) {
             _ = c.QueryPerformanceCounter(&t1);
             applog.appLog("[d2d] [TIMING] D2D1CreateFactory: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
@@ -217,15 +230,71 @@ pub const Renderer = struct {
         return self;
     }
 
-    /// Phase 2 of two-phase init: creates the D2D HwndRenderTarget and atlas
-    /// resources. Must be called before any rendering operations.
-    pub fn initRenderTarget(self: *Renderer) !void {
+    /// Phase 2: Create D2D device context from a D3D11 device via DXGI.
+    /// Falls back to legacy HwndRenderTarget if Factory1 is not available.
+    pub fn initD2DDeviceContext(self: *Renderer, d3d_device: *c.ID3D11Device) !void {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
         var t1: c.LARGE_INTEGER = undefined;
         if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
 
-        // Create render target for hwnd
+        if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
+
+        const factory1 = self.d2d_factory1 orelse {
+            // Fallback to legacy HwndRenderTarget
+            if (applog.isEnabled()) applog.appLog("[d2d] No ID2D1Factory1, falling back to HwndRenderTarget\n", .{});
+            try self.recreateRenderTarget();
+            if (applog.isEnabled()) {
+                _ = c.QueryPerformanceCounter(&t1);
+                applog.appLog("[d2d] [TIMING] initRenderTarget (fallback): {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+            }
+            return;
+        };
+
+        // Get IDXGIDevice from D3D11 device
+        var dxgi_dev: ?*c.IDXGIDevice = null;
+        const dev_unk: *c.IUnknown = @ptrCast(d3d_device);
+        const qi = dev_unk.lpVtbl.*.QueryInterface orelse return error.D2DDeviceContextFailed;
+        const hr_dxgi = qi(dev_unk, &c.IID_IDXGIDevice, @ptrCast(&dxgi_dev));
+        if (c.FAILED(hr_dxgi) or dxgi_dev == null) return error.D2DDeviceContextFailed;
+        defer {
+            const rel = dxgi_dev.?.lpVtbl.*.Release orelse null;
+            if (rel) |f| _ = f(dxgi_dev.?);
+        }
+
+        // Create ID2D1Device from IDXGIDevice
+        var d2d_device: ?*c.ID2D1Device = null;
+        const fac1_vtbl = factory1.lpVtbl.*;
+        const create_dev_fn = fac1_vtbl.CreateDevice orelse return error.D2DDeviceContextFailed;
+        const hr_dev = create_dev_fn(factory1, @ptrCast(dxgi_dev.?), @ptrCast(&d2d_device));
+        if (c.FAILED(hr_dev) or d2d_device == null) return error.D2DDeviceContextFailed;
+        self.d2d_device = d2d_device;
+
+        // Create ID2D1DeviceContext from ID2D1Device
+        var d2d_ctx: ?*c.ID2D1DeviceContext = null;
+        const dev_vtbl = d2d_device.?.lpVtbl.*;
+        const create_ctx_fn = dev_vtbl.CreateDeviceContext orelse return error.D2DDeviceContextFailed;
+        const hr_ctx = create_ctx_fn(d2d_device.?, c.D2D1_DEVICE_CONTEXT_OPTIONS_NONE, @ptrCast(&d2d_ctx));
+        if (c.FAILED(hr_ctx) or d2d_ctx == null) return error.D2DDeviceContextFailed;
+        self.d2d_device_ctx = d2d_ctx;
+
+        if (applog.isEnabled()) applog.appLog("[d2d] D2D device context created from D3D11 device\n", .{});
+
+        // Create atlas resources on the device context
+        try self.createAtlasResources();
+
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
+    }
+
+    /// Legacy phase 2: creates the D2D HwndRenderTarget and atlas resources.
+    pub fn initRenderTarget(self: *Renderer) !void {
+        var freq: c.LARGE_INTEGER = undefined;
+        var t0: c.LARGE_INTEGER = undefined;
+        var t1: c.LARGE_INTEGER = undefined;
+        if (applog.isEnabled()) _ = c.QueryPerformanceFrequency(&freq);
         if (applog.isEnabled()) _ = c.QueryPerformanceCounter(&t0);
         try self.recreateRenderTarget();
         if (applog.isEnabled()) {
@@ -267,6 +336,9 @@ pub const Renderer = struct {
         safeRelease(self.italic_font_face);
         safeRelease(self.bold_italic_font_face);
         safeRelease(self.rt);
+        safeRelease(self.d2d_device_ctx);
+        safeRelease(self.d2d_device);
+        safeRelease(self.d2d_factory1);
         safeRelease(self.dwrite_factory);
         safeRelease(self.d2d_factory);
         self.* = undefined;
@@ -409,20 +481,26 @@ pub const Renderer = struct {
     }
 
     fn createAtlasResources(self: *Renderer) !void {
-        const rt = self.rt orelse return;
-    
+        // Use D2D device context if available, otherwise fall back to HwndRenderTarget.
+        const rt_base: *c.ID2D1RenderTarget = if (self.d2d_device_ctx) |ctx|
+            @as(*c.ID2D1RenderTarget, @ptrCast(ctx))
+        else if (self.rt) |rt|
+            @as(*c.ID2D1RenderTarget, @ptrCast(rt))
+        else
+            return;
+
         safeRelease(self.atlas_bitmap);
         self.atlas_bitmap = null;
-        
+
         safeRelease(self.solid_brush);
         self.solid_brush = null;
-    
+
         self.glyph_map.clearRetainingCapacity();
         self.styled_glyph_map.clearRetainingCapacity();
         self.atlas_next_x = 1;
         self.atlas_next_y = 1;
         self.atlas_row_h = 0;
-    
+
         // RGBA format for true ClearType subpixel rendering
         const props = c.D2D1_BITMAP_PROPERTIES{
             .pixelFormat = c.D2D1_PIXEL_FORMAT{
@@ -432,12 +510,9 @@ pub const Renderer = struct {
             .dpiX = 96.0,
             .dpiY = 96.0,
         };
-    
+
         var bmp: ?*c.ID2D1Bitmap = null;
         const sz = c.D2D1_SIZE_U{ .width = self.atlas_w, .height = self.atlas_h };
-
-        // ★ HwndRenderTarget vtbl doesn't expose CreateBitmap, so cast to base RenderTarget
-        const rt_base: *c.ID2D1RenderTarget = @as(*c.ID2D1RenderTarget, @ptrCast(rt));
         const vtbl = rt_base.lpVtbl.*;
         
         const hr = if (vtbl.CreateBitmap) |create_bitmap_fn| blk: {
