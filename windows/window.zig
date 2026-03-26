@@ -2526,6 +2526,11 @@ pub export fn WndProc(
 
                 if (deferred_log_enabled) applog.appLog("  renderer created ok", .{});
 
+                if (app.atlas) |*a| {
+                    app.cell_w_px = a.cellW();
+                    app.cell_h_px = a.cellH();
+                }
+
                 // Process pending glyphs that were requested before atlas was ready
                 // (happens when nvim spawn runs in parallel with renderer init)
                 {
