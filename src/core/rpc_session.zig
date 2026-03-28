@@ -989,6 +989,14 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
                 else return;  // unknown value: keep existing setting
             self.option_as_meta.store(val, .release);
         }
+    } else if (std.mem.eql(u8, method, "zonvie_workspace_scale_in")) {
+        if (self.cb.on_workspace_scale) |cb| {
+            cb(self.ctx, 1); // direction: 1 = scale in (zoom toward fullscreen)
+        }
+    } else if (std.mem.eql(u8, method, "zonvie_workspace_scale_out")) {
+        if (self.cb.on_workspace_scale) |cb| {
+            cb(self.ctx, -1); // direction: -1 = scale out (zoom toward grid)
+        }
     }
 }
 
@@ -1287,6 +1295,11 @@ pub fn runLoop(self: *Core) void {
     self.flushPendingFocus();
     self.requestTryResize(self.init_rows, self.init_cols) catch |e| self.log.write("try_resize send failed: {any}\n", .{e});
     self.requestCommand("redraw!") catch |e| self.log.write("redraw! send failed: {any}\n", .{e});
+
+    // Register workspace scale commands (ZonvieWorkspaceScaleIn/Out).
+    // Uses rpcnotify(0, ...) which delivers to all UI channels including ours.
+    self.requestCommand("command! ZonvieWorkspaceScaleIn call rpcnotify(0, 'zonvie_workspace_scale_in')") catch |e| self.log.write("register ZonvieWorkspaceScaleIn failed: {any}\n", .{e});
+    self.requestCommand("command! ZonvieWorkspaceScaleOut call rpcnotify(0, 'zonvie_workspace_scale_out')") catch |e| self.log.write("register ZonvieWorkspaceScaleOut failed: {any}\n", .{e});
 
     // Glow config is requested via glow_startup_retries during flush processing.
     // -c commands may not have run yet at this point.

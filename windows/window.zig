@@ -337,6 +337,9 @@ pub export fn WndProc(
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
 
+                // Initialize workspace system menu items
+                app.workspace.updateSystemMenu(hwnd);
+
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
 
@@ -2170,6 +2173,13 @@ pub export fn WndProc(
                 if (deferred_log_enabled) applog.appLog("  core_create callbacks ptr ctx(app)={*}", .{app});
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 app.corep = core.zonvie_core_create(&cb, @sizeOf(core.Callbacks), app);
+
+                // Initialize workspace state and attach core to tile 0
+                app.workspace = app_mod.workspace_mod.WorkspaceState.init(app.alloc);
+                if (app.corep) |cp| {
+                    app.workspace.attachCore(0, cp);
+                }
+
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
                     const core_create_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
@@ -3549,6 +3559,26 @@ pub export fn WndProc(
                 }
             }
             return 0;
+        },
+
+        c.WM_SYSCOMMAND => {
+            const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
+            if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
+                // TODO: Phase 2 — open connection dialog for new workspace tile
+                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: New Session requested\n", .{});
+                return 0;
+            }
+            if (cmd >= app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE and
+                cmd < app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + 9)
+            {
+                const index: u8 = @intCast(cmd - app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE);
+                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: Switch to session {d}\n", .{index});
+                if (getApp(hwnd)) |app| {
+                    app.workspace.switchToTile(index);
+                }
+                return 0;
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
         c.WM_CLOSE => {

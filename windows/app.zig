@@ -11,6 +11,7 @@ pub const c = @import("win32.zig").c;
 pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
+pub const workspace_mod = @import("workspace.zig");
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
@@ -2344,6 +2345,11 @@ pub const App = struct {
     content_hwnd: ?c.HWND = null, // Child window for D3D11 rendering (when ext_tabline enabled)
     corep: ?*zonvie_core = null,
 
+    // Workspace tile manager (multi-core support).
+    // Phase 1: workspace state is initialized alongside corep.
+    // Future phases will migrate corep references to workspace.activeCorep().
+    workspace: workspace_mod.WorkspaceState = .{ .alloc = undefined },
+
     ui_thread_id: u32 = 0,
 
     // Atlas builder (DirectWrite + CPU atlas, metrics)
@@ -2853,6 +2859,9 @@ pub const App = struct {
 
         if (self.corep) |p| zonvie_core_destroy(p);
         self.corep = null;
+
+        // Clean up workspace tile contexts
+        self.workspace.deinit();
 
         // Clipboard event cleanup
         if (self.clipboard_event != null) {

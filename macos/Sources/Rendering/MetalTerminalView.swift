@@ -2307,4 +2307,24 @@ extension MetalTerminalView {
         }
         return true
     }
+
+    // MARK: - Workspace magnify gesture (pinch to zoom out/in)
+
+    // MARK: - Snapshot capture (for workspace tile thumbnails)
+
+    /// Capture the current back buffer as a persistent texture for workspace
+    /// tile thumbnail display. Delegates to the renderer.
+    func captureSnapshot() -> MTLTexture? {
+        return renderer?.captureSnapshot()
+    }
+
+    /// Prepare the renderer for a new core (workspace tile switch).
+    /// Destroys the backBuffer so old content is not shown.
+    func prepareForNewCore() {
+        renderer?.prepareForNewCore()
+    }
 }
+
+// MARK: - SnapshotCapturing
+
+extension MetalTerminalView: SnapshotCapturing {}

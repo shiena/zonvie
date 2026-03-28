@@ -26,6 +26,26 @@ final class ZonvieCore {
     private var progressWindow: NSWindow?
     private var isDevcontainerMode: Bool = false
 
+    /// Workspace connection config. When set, start() uses these values
+    /// instead of parsing CLI arguments for SSH/devcontainer settings.
+    var workspaceConfig: WorkspaceManager.ConnectionConfig?
+
+    /// Back-reference to the workspace manager (set by WorkspaceManager on attach/start).
+    weak var workspaceManager: WorkspaceManager?
+
+    /// Off-screen tile renderer for workspace thumbnails.
+    /// Active when this core is NOT the active tile (terminalView == nil).
+    /// Receives vertex data and renders to an off-screen texture.
+    var tileRenderer: TileRenderer?
+
+    /// Public access to the opaque core pointer (for C API calls from WorkspaceManager).
+    var corePointer: OpaquePointer? { core }
+
+    /// Set to true when the core switches from tileRenderer to terminalView.
+    /// Checked in on_flush_begin (on the core's own RPC thread) to safely
+    /// invalidate the glyph cache before the flush proceeds.
+    var needsGlyphInvalidation: Bool = false
+
     // Wire this from ViewController.
     weak var terminalView: MetalTerminalView? {
         didSet {
@@ -42,6 +62,15 @@ final class ZonvieCore {
     // Notification posted when Neovim is ready (first vertices received)
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
     private var hasNotifiedReady = false
+
+    // Notification posted when workspace scale command is received (direction as object: Int)
+    static let workspaceScaleNotification = NSNotification.Name("ZonvieWorkspaceScale")
+
+    // Notification posted from external windows to request tile view on main window
+    static let enterTileViewNotification = NSNotification.Name("ZonvieEnterTileView")
+
+    // Notification posted when a nvim process exits (object = ZonvieCore instance)
+    static let nvimExitedNotification = NSNotification.Name("ZonvieNvimExited")
 
     // Notification posted when colorscheme (default bg/fg) changes
     static let colorschemeDidChangeNotification = NSNotification.Name("ZonvieColorschemeDidChange")
@@ -191,15 +220,29 @@ final class ZonvieCore {
 
                 if gridId == 1 {
                     // Main window
-                    guard let view = core.terminalView else { return }
-                    view.submitVerticesRowRaw(
-                        rowStart: Int(rowStart),
-                        rowCount: Int(rowCount),
-                        ptr: verts,
-                        count: Int(vertCount),
-                        flags: flags,
-                        totalRows: Int(totalRows)
-                    )
+                    if let view = core.terminalView {
+                        view.submitVerticesRowRaw(
+                            rowStart: Int(rowStart),
+                            rowCount: Int(rowCount),
+                            ptr: verts,
+                            count: Int(vertCount),
+                            flags: flags,
+                            totalRows: Int(totalRows)
+                        )
+                    } else if let tr = core.tileRenderer {
+                        // Off-screen tile renderer
+                        tr.submitVerticesRow(
+                            rowStart: Int(rowStart),
+                            rowCount: Int(rowCount),
+                            ptr: verts,
+                            count: Int(vertCount),
+                            totalRows: Int(totalRows)
+                        )
+                        // Also capture cursor
+                        if flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR) != 0 {
+                            // Cursor vertices follow in a separate callback
+                        }
+                    }
                 } else {
                     // External grid: submit vertices directly from core thread.
                     // ExternalGridView's triple-buffered methods are thread-safe.
@@ -581,6 +624,22 @@ final class ZonvieCore {
             on_flush_begin: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+
+                // Off-screen tile renderer path
+                if me.terminalView == nil, let tr = me.tileRenderer {
+                    tr.beginFlush()
+                    return
+                }
+
+                // If the core just switched from tileRenderer to terminalView,
+                // invalidate glyph cache on the core's own RPC thread (safe).
+                if me.needsGlyphInvalidation {
+                    me.needsGlyphInvalidation = false
+                    if let corePtr = me.core {
+                        zonvie_core_invalidate_glyph_cache(corePtr)
+                    }
+                }
+
                 let result = me.terminalView?.renderer.beginFlush() ?? .dropped
                 guard let corePtr = me.core else { return }
 
@@ -620,12 +679,18 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 // Read drawable size from core while grid_mu is still held.
-                // These values match exactly what the flush used for NDC computation.
                 var dw: UInt32 = 0
                 var dh: UInt32 = 0
                 if let corePtr = me.core {
                     zonvie_core_get_layout(corePtr, &dw, &dh, nil, nil)
                 }
+
+                // Off-screen tile renderer path
+                if me.terminalView == nil, let tr = me.tileRenderer {
+                    tr.commitFlush(drawableW: Int(dw), drawableH: Int(dh))
+                    return
+                }
+
                 me.terminalView?.renderer.commitFlush(drawableW: dw, drawableH: dh)
                 // Pass Neovim default background to renderer for viewport-edge clear color
                 if let corePtr = me.core {
@@ -776,6 +841,21 @@ final class ZonvieCore {
                     rowsDelta: Int(rowsDelta),
                     totalRows: Int(totalRows), totalCols: Int(totalCols)
                 )
+            },
+
+            on_workspace_scale: { ctx, direction in
+                guard let ctx else { return }
+                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    // Apply scale change directly to WorkspaceManager.
+                    // The didSet on scale posts workspaceScaleNotification,
+                    // which all overlay controllers observe for visibility sync.
+                    if direction > 0 {
+                        core.workspaceManager?.scaleIn()
+                    } else {
+                        core.workspaceManager?.scaleOut()
+                    }
+                }
             }
         )
 
@@ -872,112 +952,94 @@ final class ZonvieCore {
         let args = CommandLine.arguments
         ZonvieCore.appLog("[start] CommandLine.arguments = \(args)")
 
-        // ext_cmdline: CLI flag or config file
-        let hasExtCmdline = args.contains("--extcmdline") || ZonvieConfig.shared.cmdline.external
-        ZonvieCore.appLog("[start] hasExtCmdline = \(hasExtCmdline) (cli=\(args.contains("--extcmdline")), config=\(ZonvieConfig.shared.cmdline.external))")
-
-        if hasExtCmdline {
-            ZonvieCore.appLog("[start] enabling ext_cmdline")
-            setExtCmdline(true)
-        }
-
-        // ext_popupmenu: CLI flag or config file
-        let hasExtPopup = args.contains("--extpopup") || ZonvieConfig.shared.popup.external
-        ZonvieCore.appLog("[start] hasExtPopup = \(hasExtPopup) (cli=\(args.contains("--extpopup")), config=\(ZonvieConfig.shared.popup.external))")
-
-        if hasExtPopup {
-            ZonvieCore.appLog("[start] enabling ext_popupmenu")
-            setExtPopupmenu(true)
-        }
-
-        // ext_messages: CLI flag or config file
-        let hasExtMessages = args.contains("--extmessages") || ZonvieConfig.shared.messages.external
-        ZonvieCore.appLog("[start] hasExtMessages = \(hasExtMessages) (cli=\(args.contains("--extmessages")), config=\(ZonvieConfig.shared.messages.external))")
-
-        if hasExtMessages {
-            ZonvieCore.appLog("[start] enabling ext_messages")
-            setExtMessages(true)
-        }
-
-        // ext_tabline: CLI flag or config file
-        let hasExtTabline = args.contains("--exttabline") || ZonvieConfig.shared.tabline.external
-        ZonvieCore.appLog("[start] hasExtTabline = \(hasExtTabline) (cli=\(args.contains("--exttabline")), config=\(ZonvieConfig.shared.tabline.external))")
-
-        if hasExtTabline {
-            ZonvieCore.appLog("[start] enabling ext_tabline")
-            setExtTabline(true)
-        }
-
-        // ext_windows: CLI flag or config file
+        // Resolve ext_* options: workspaceConfig > CLI > config file
+        let wc = workspaceConfig
+        let hasExtCmdline = wc?.extCmdline ?? (args.contains("--extcmdline") || ZonvieConfig.shared.cmdline.external)
+        let hasExtPopup = wc?.extPopupmenu ?? (args.contains("--extpopup") || ZonvieConfig.shared.popup.external)
+        let hasExtMessages = wc?.extMessages ?? (args.contains("--extmessages") || ZonvieConfig.shared.messages.external)
+        let hasExtTabline = wc?.extTabline ?? (args.contains("--exttabline") || ZonvieConfig.shared.tabline.external)
         let hasExtWindows = args.contains("--extwindows") || ZonvieConfig.shared.windows.external
-        ZonvieCore.appLog("[start] hasExtWindows = \(hasExtWindows) (cli=\(args.contains("--extwindows")), config=\(ZonvieConfig.shared.windows.external))")
 
-        if hasExtWindows {
-            ZonvieCore.appLog("[start] enabling ext_windows")
-            setExtWindows(true)
-        }
+        if hasExtCmdline { setExtCmdline(true) }
+        if hasExtPopup { setExtPopupmenu(true) }
+        if hasExtMessages { setExtMessages(true) }
+        if hasExtTabline { setExtTabline(true) }
+        if hasExtWindows { setExtWindows(true) }
 
-        // Parse SSH arguments from CLI: --ssh=user@host[:port], --ssh-identity=path
+        ZonvieCore.appLog("[start] ext: cmdline=\(hasExtCmdline) popup=\(hasExtPopup) messages=\(hasExtMessages) tabline=\(hasExtTabline) windows=\(hasExtWindows)")
+
+        // Resolve SSH/devcontainer settings.
+        // Priority: workspaceConfig (tile menu) > CLI args > config file.
         var sshHost: String? = nil
         var sshPort: Int? = nil
         var sshIdentity: String? = nil
-
-        // Parse devcontainer arguments from CLI: --devcontainer=path, --devcontainer-config=path, --devcontainer-rebuild
         var devcontainerWorkspace: String? = nil
         var devcontainerConfig: String? = nil
         var devcontainerRebuild: Bool = false
 
-        var argIdx = 0
-        while argIdx < args.count {
-            let arg = args[argIdx]
-            if arg.hasPrefix("--ssh=") {
-                let value = String(arg.dropFirst("--ssh=".count))
-                // Parse user@host:port format (port is after last colon, but only if it's numeric)
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    sshHost = String(value[..<lastColon])
-                    sshPort = portPart
-                } else {
-                    sshHost = value
-                }
-            } else if arg == "--ssh" && argIdx + 1 < args.count {
-                // Space-separated: --ssh user@host[:port]
-                let value = args[argIdx + 1]
-                argIdx += 1
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    sshHost = String(value[..<lastColon])
-                    sshPort = portPart
-                } else {
-                    sshHost = value
-                }
-            } else if arg.hasPrefix("--ssh-identity=") {
-                sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
-            } else if arg == "--ssh-identity" && argIdx + 1 < args.count {
-                sshIdentity = args[argIdx + 1]
-                argIdx += 1
-            } else if arg.hasPrefix("--devcontainer=") {
-                devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
-            } else if arg == "--devcontainer" && argIdx + 1 < args.count {
-                devcontainerWorkspace = args[argIdx + 1]
-                argIdx += 1
-            } else if arg.hasPrefix("--devcontainer-config=") {
-                devcontainerConfig = String(arg.dropFirst("--devcontainer-config=".count))
-            } else if arg == "--devcontainer-config" && argIdx + 1 < args.count {
-                devcontainerConfig = args[argIdx + 1]
-                argIdx += 1
-            } else if arg == "--devcontainer-rebuild" {
-                devcontainerRebuild = true
+        if let wc = workspaceConfig {
+            // Workspace tile config takes priority
+            ZonvieCore.appLog("[start] workspaceConfig: name=\(wc.name) isSSH=\(wc.isSSH) sshHost=\(wc.sshHost) isDevcontainer=\(wc.isDevcontainer)")
+            if wc.isSSH {
+                sshHost = wc.sshHost
+                sshPort = Int(wc.sshPort)
+                sshIdentity = wc.sshIdentity.isEmpty ? nil : wc.sshIdentity
+            } else if wc.isDevcontainer {
+                devcontainerWorkspace = wc.devcontainerWorkspace
+                devcontainerConfig = wc.devcontainerConfig.isEmpty ? nil : wc.devcontainerConfig
             }
-            argIdx += 1
-        }
+        } else {
+            // Parse from CLI arguments
+            var argIdx = 0
+            while argIdx < args.count {
+                let arg = args[argIdx]
+                if arg.hasPrefix("--ssh=") {
+                    let value = String(arg.dropFirst("--ssh=".count))
+                    if let lastColon = value.lastIndex(of: ":"),
+                       let portPart = Int(value[value.index(after: lastColon)...]) {
+                        sshHost = String(value[..<lastColon])
+                        sshPort = portPart
+                    } else {
+                        sshHost = value
+                    }
+                } else if arg == "--ssh" && argIdx + 1 < args.count {
+                    let value = args[argIdx + 1]
+                    argIdx += 1
+                    if let lastColon = value.lastIndex(of: ":"),
+                       let portPart = Int(value[value.index(after: lastColon)...]) {
+                        sshHost = String(value[..<lastColon])
+                        sshPort = portPart
+                    } else {
+                        sshHost = value
+                    }
+                } else if arg.hasPrefix("--ssh-identity=") {
+                    sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
+                } else if arg == "--ssh-identity" && argIdx + 1 < args.count {
+                    sshIdentity = args[argIdx + 1]
+                    argIdx += 1
+                } else if arg.hasPrefix("--devcontainer=") {
+                    devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
+                } else if arg == "--devcontainer" && argIdx + 1 < args.count {
+                    devcontainerWorkspace = args[argIdx + 1]
+                    argIdx += 1
+                } else if arg.hasPrefix("--devcontainer-config=") {
+                    devcontainerConfig = String(arg.dropFirst("--devcontainer-config=".count))
+                } else if arg == "--devcontainer-config" && argIdx + 1 < args.count {
+                    devcontainerConfig = args[argIdx + 1]
+                    argIdx += 1
+                } else if arg == "--devcontainer-rebuild" {
+                    devcontainerRebuild = true
+                }
+                argIdx += 1
+            }
 
-        // Fall back to config if not specified via CLI
-        let config = ZonvieConfig.shared
-        if sshHost == nil && config.neovim.ssh {
-            sshHost = config.neovim.sshHost
-            sshPort = sshPort ?? config.neovim.sshPort
-            sshIdentity = sshIdentity ?? config.neovim.sshIdentity
+            // Fall back to config file if not specified via CLI
+            let config = ZonvieConfig.shared
+            if sshHost == nil && config.neovim.ssh {
+                sshHost = config.neovim.sshHost
+                sshPort = sshPort ?? config.neovim.sshPort
+                sshIdentity = sshIdentity ?? config.neovim.sshIdentity
+            }
         }
 
         ZonvieCore.appLog("[start] SSH config: host=\(sshHost ?? "nil"), port=\(sshPort ?? -1), identity=\(sshIdentity ?? "nil")")
@@ -1034,9 +1096,14 @@ final class ZonvieCore {
             } else {
                 ZonvieCore.appLog("[start] SSH mode: password auth")
             }
-            sshCmd += " -o StrictHostKeyChecking=accept-new"
-            // Use --nvim override for remote nvim path, default to bare "nvim" (PATH lookup)
-            let remoteNvim = cliNvimPath ?? "nvim"
+            sshCmd += " -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8"
+            // Remote nvim path: workspace config > CLI override > bare "nvim" (PATH lookup)
+            let remoteNvim: String
+            if let wc = workspaceConfig, !wc.nvimPath.isEmpty {
+                remoteNvim = wc.nvimPath
+            } else {
+                remoteNvim = cliNvimPath ?? "nvim"
+            }
             // Escape \ for remote shell double-quote context
             let escapedNvim = remoteNvim.replacingOccurrences(of: "\\", with: "\\\\")
             // Quote path with \" for remote shell: Zig parser preserves \" inside single-quotes,
@@ -1550,7 +1617,8 @@ final class ZonvieCore {
     /// Show native dialog for unsaved buffers confirmation.
     private func showUnsavedDialog() {
         let alert = NSAlert()
-        alert.messageText = "Unsaved Changes"
+        let name = workspaceConfig?.displayName
+        alert.messageText = name != nil ? "Unsaved Changes — \(name!)" : "Unsaved Changes"
         alert.informativeText = "You have unsaved changes. Do you want to discard them and quit?"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Discard and Quit")
@@ -1566,7 +1634,8 @@ final class ZonvieCore {
     /// Show dialog when Neovim is not responding to quit request.
     private func showNotRespondingDialog() {
         let alert = NSAlert()
-        alert.messageText = "Neovim Not Responding"
+        let name = workspaceConfig?.displayName
+        alert.messageText = name != nil ? "Neovim Not Responding — \(name!)" : "Neovim Not Responding"
         alert.informativeText = "Neovim is not responding. Do you want to force quit?"
         alert.alertStyle = .critical
         alert.addButton(withTitle: "Force Quit")
@@ -2141,7 +2210,8 @@ final class ZonvieCore {
     }
 
     private func onGuiFont(bytes: UnsafePointer<UInt8>, len: Int) {
-        guard let view = terminalView else { return }
+        // Must have either terminalView or tileRenderer to apply font
+        guard terminalView != nil || tileRenderer != nil else { return }
 
         let data = Data(bytes: bytes, count: max(0, len))
         guard let s = String(data: data, encoding: .utf8) else { return }
@@ -2196,18 +2266,31 @@ final class ZonvieCore {
         // Apply font SYNCHRONOUSLY so that rasterizeOnly (called during
         // the same flush's vertex generation) uses the new font immediately.
         // atlas.setFont() is thread-safe (protected by os_unfair_lock).
-        view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
+        if let view = terminalView {
+            view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
 
-        // Notify core of new cell dimensions so vertex positions match
-        // the new glyph metrics. updateLayoutPx detects in_handle_redraw
-        // and takes the lock-free path (grid_mu already held by flush).
-        let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-        let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
-        let ds = view.currentDrawableSize
-        let dw = max(1, Int(ds.width))
-        let dh = max(1, Int(ds.height))
-        updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
-                       cellW: UInt32(cw), cellH: UInt32(ch))
+            // Notify core of new cell dimensions so vertex positions match
+            // the new glyph metrics. updateLayoutPx detects in_handle_redraw
+            // and takes the lock-free path (grid_mu already held by flush).
+            let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+            let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+            let ds = view.currentDrawableSize
+            let dw = max(1, Int(ds.width))
+            let dh = max(1, Int(ds.height))
+            updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
+                           cellW: UInt32(cw), cellH: UInt32(ch))
+        } else if let tr = tileRenderer {
+            // Off-screen: apply font to tile renderer's atlas
+            tr.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
+
+            let cw = max(1, Int(tr.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
+            let ch = max(1, Int(tr.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+            // Use tile renderer's texture size for layout
+            let dw = max(1, tr.textureWidth)
+            let dh = max(1, tr.textureHeight)
+            updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
+                           cellW: UInt32(cw), cellH: UInt32(ch))
+        }
 
         // Force-dirty all rows and invalidate glyph/scroll caches.
         // When only the font weight changes (same cell dimensions), Neovim
@@ -2219,7 +2302,7 @@ final class ZonvieCore {
 
         // GUI-only updates (redraw, external window notify) can be async.
         DispatchQueue.main.async { [weak self] in
-            view.requestRedraw()
+            self?.terminalView?.requestRedraw()
             self?.externalGridViews.values.forEach {
                 $0.notifyFontChanged()
                 $0.requestRedraw()
@@ -2268,30 +2351,54 @@ final class ZonvieCore {
         return exitCode
     }
 
+    /// Info passed via nvimExitedNotification.
+    struct NvimExitInfo {
+        let core: ZonvieCore
+        let exitCode: Int32
+        let connectionName: String
+    }
+
     private func onExitFromNvim(exitCode: Int32) {
         ZonvieCore.exitCode = exitCode
-        Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode), exiting now")
+        Self.appLog("[ZonvieCore] onExitFromNvim: code=\(exitCode)")
+
+        let info = NvimExitInfo(
+            core: self,
+            exitCode: exitCode,
+            connectionName: workspaceConfig?.displayName ?? "nvim"
+        )
+
+        // Post notification so WorkspaceManager can decide whether to show
+        // the tile view (other sessions still running) or exit the app.
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(
+                name: ZonvieCore.nvimExitedNotification,
+                object: info
+            )
+        }
+    }
+
+    /// Terminate the app (called when no workspace sessions remain).
+    static func terminateApp() {
         // Use NSApp.stop() to break the run loop so app.run() returns to
         // main.swift, where Darwin.exit(exitCode) preserves the exit code.
         // NSApp.terminate() would call exit(0) internally, losing the code.
         // Darwin.exit() directly would skip AppKit teardown and crash when
         // DispatchSemaphore is disposed mid-wait (MTKView inflightSemaphore).
-        DispatchQueue.main.async {
-            NSApp.stop(nil)
-            // NSApp.stop requires a pending event to actually break the loop
-            let event = NSEvent.otherEvent(
-                with: .applicationDefined,
-                location: .zero,
-                modifierFlags: [],
-                timestamp: 0,
-                windowNumber: 0,
-                context: nil,
-                subtype: 0,
-                data1: 0,
-                data2: 0
-            )
-            if let event { NSApp.postEvent(event, atStart: true) }
-        }
+        NSApp.stop(nil)
+        // NSApp.stop requires a pending event to actually break the loop
+        let event = NSEvent.otherEvent(
+            with: .applicationDefined,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 0,
+            data1: 0,
+            data2: 0
+        )
+        if let event { NSApp.postEvent(event, atStart: true) }
     }
 
     // MARK: - External Window Support
@@ -4003,6 +4110,26 @@ final class ZonvieCore {
 
         if ZonvieConfig.shared.blurEnabled {
             ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
+        }
+    }
+
+    /// Hide all normal (non-decorated) external windows.
+    /// Called when entering workspace tile view to consolidate into main window.
+    func hideNormalExternalWindows() {
+        for (gridId, window) in externalWindows {
+            if classifyExternalGridKind(gridId) == .normal {
+                window.orderOut(nil)
+            }
+        }
+    }
+
+    /// Show all normal (non-decorated) external windows.
+    /// Called when exiting workspace tile view to restore multi-window layout.
+    func showNormalExternalWindows() {
+        for (gridId, window) in externalWindows {
+            if classifyExternalGridKind(gridId) == .normal {
+                window.orderFront(nil)
+            }
         }
     }
 

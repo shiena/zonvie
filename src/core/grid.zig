@@ -992,6 +992,9 @@ pub const Grid = struct {
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
 
+        // mode_infos
+        if (self.mode_infos.capacity > 0) self.mode_infos.deinit(self.alloc);
+
         // cursor
         self.cursor_valid = false;
         self.cursor_grid = 1;
@@ -1015,9 +1018,6 @@ pub const Grid = struct {
         // ext_messages
         self.message_state.deinit(self.alloc);
         self.msg_history_state.deinit(self.alloc);
-
-        // mode info
-        self.mode_infos.deinit(self.alloc);
 
         // cell overflow (values are inline, no per-entry free needed)
         self.cell_overflow.deinit(self.alloc);
