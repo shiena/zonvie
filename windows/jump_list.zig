@@ -29,6 +29,7 @@ const CLSCTX_INPROC_SERVER: c.DWORD = 0x1;
 
 extern "ole32" fn CoInitializeEx(pvReserved: ?*anyopaque, dwCoInit: c.DWORD) callconv(.winapi) HRESULT;
 extern "ole32" fn CoCreateInstance(rclsid: *const GUID, pUnkOuter: ?*anyopaque, dwClsContext: c.DWORD, riid: *const GUID, ppv: *?*anyopaque) callconv(.winapi) HRESULT;
+extern "shell32" fn SetCurrentProcessExplicitAppUserModelID(AppID: [*:0]const u16) callconv(.winapi) HRESULT;
 
 // ============================================================
 // COM GUIDs
@@ -247,12 +248,20 @@ fn comQueryInterface(obj: *anyopaque, iid: *const GUID) ?*anyopaque {
 // Public API
 // ============================================================
 
-/// Initialize COM for the calling thread (STA).
-/// Call once from main() before any COM usage.
+const APP_USER_MODEL_ID = std.unicode.utf8ToUtf16LeStringLiteral("Zonvie.Zonvie");
+
+/// Initialize COM for the calling thread (STA) and set AppUserModelID.
+/// Call once from main() before any COM usage or window creation.
 pub fn initCom() void {
     const hr = CoInitializeEx(null, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (hr != S_OK and hr != 1) { // 1 = S_FALSE (already initialized)
         if (applog.isEnabled()) applog.appLog("[win] CoInitializeEx failed: 0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
+    }
+
+    // AppUserModelID is required for Jump List association with the taskbar button.
+    const hr2 = SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID);
+    if (hr2 != S_OK) {
+        if (applog.isEnabled()) applog.appLog("[win] SetCurrentProcessExplicitAppUserModelID failed: 0x{x:0>8}\n", .{@as(u32, @bitCast(hr2))});
     }
 }
 
@@ -304,14 +313,24 @@ pub fn initJumpList() void {
     // Create "New Session" shell link
     if (createShellLink(exe_path, std.unicode.utf8ToUtf16LeStringLiteral("--nofork"), std.unicode.utf8ToUtf16LeStringLiteral("New Session"))) |link| {
         const coll_vtbl = comVtbl(IObjectCollectionVtbl, collection);
-        _ = coll_vtbl.AddObject(collection, link);
+        hr = coll_vtbl.AddObject(collection, link);
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: AddObject hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
         comRelease(link);
+    } else {
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: createShellLink failed\n", .{});
+        _ = dest_vtbl.AbortList(dest_list);
+        return;
     }
 
     // Get IObjectArray from collection for AddUserTasks
     if (comQueryInterface(collection, &IID_IObjectArray)) |array| {
-        _ = dest_vtbl.AddUserTasks(dest_list, array);
+        hr = dest_vtbl.AddUserTasks(dest_list, array);
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: AddUserTasks hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
         comRelease(array);
+    } else {
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: QI for IObjectArray failed\n", .{});
+        _ = dest_vtbl.AbortList(dest_list);
+        return;
     }
 
     // Commit
@@ -328,14 +347,19 @@ pub fn initJumpList() void {
 fn createShellLink(exe_path: [*:0]const u16, args: [*:0]const u16, title: [*:0]const u16) ?*anyopaque {
     var link_raw: ?*anyopaque = null;
     const hr = CoCreateInstance(&CLSID_ShellLink, null, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, &link_raw);
-    if (hr != S_OK or link_raw == null) return null;
+    if (hr != S_OK or link_raw == null) {
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: CoCreateInstance(ShellLink) failed: 0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
+        return null;
+    }
     const link = link_raw.?;
 
     const link_vtbl = comVtbl(IShellLinkWVtbl, link);
 
     // Set path and arguments
-    _ = link_vtbl.SetPath(link, exe_path);
-    _ = link_vtbl.SetArguments(link, args);
+    var hr2 = link_vtbl.SetPath(link, exe_path);
+    if (applog.isEnabled()) applog.appLog("[win] Jump List: SetPath hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr2))});
+    hr2 = link_vtbl.SetArguments(link, args);
+    if (applog.isEnabled()) applog.appLog("[win] Jump List: SetArguments hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr2))});
 
     // Set icon to our own exe (resource index 0 = app icon)
     _ = link_vtbl.SetIconLocation(link, exe_path, 0);
@@ -344,9 +368,13 @@ fn createShellLink(exe_path: [*:0]const u16, args: [*:0]const u16, title: [*:0]c
     if (comQueryInterface(link, &IID_IPropertyStore)) |ps_raw| {
         const ps_vtbl = comVtbl(IPropertyStoreVtbl, ps_raw);
         var pv = PROPVARIANT{ .vt = VT_LPWSTR, .pwszVal = title };
-        _ = ps_vtbl.SetValue(ps_raw, &PKEY_Title, &pv);
-        _ = ps_vtbl.Commit(ps_raw);
+        hr2 = ps_vtbl.SetValue(ps_raw, &PKEY_Title, &pv);
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: SetValue(Title) hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr2))});
+        hr2 = ps_vtbl.Commit(ps_raw);
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: PropertyStore.Commit hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr2))});
         comRelease(ps_raw);
+    } else {
+        if (applog.isEnabled()) applog.appLog("[win] Jump List: QI for IPropertyStore failed\n", .{});
     }
 
     return link;
