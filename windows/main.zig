@@ -6,6 +6,7 @@ const applog = app_mod.applog;
 const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
 const dialogs = @import("ui/dialogs.zig");
+const jump_list = @import("jump_list.zig");
 const window = @import("window.zig");
 
 pub const std_options = std.Options{
@@ -117,6 +118,9 @@ pub fn main() u8 {
     // Enable Per-Monitor DPI Awareness V2 before any window creation.
     // Value -4 = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
     _ = SetProcessDpiAwarenessContext(@ptrFromInt(@as(usize, @bitCast(@as(isize, -4)))));
+
+    // Initialize COM (STA) before any COM usage (DWrite, Jump List, etc.)
+    jump_list.initCom();
 
     // Reduce Windows scheduler quantum to 1ms for responsive rendering.
     // DWrite glyph rasterization makes COM calls that can yield the thread;
@@ -659,6 +663,9 @@ pub fn main() u8 {
         }
         return 1;
     }
+
+    // Register Jump List tasks (taskbar right-click menu)
+    jump_list.initJumpList();
 
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
