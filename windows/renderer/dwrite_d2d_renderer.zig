@@ -139,6 +139,11 @@ pub const Renderer = struct {
     // so stale UV coordinates in cached row vertices are refreshed.
     atlas_reset_pending: bool = false,
 
+    // Font change detection: track name + generation to skip redundant setFont calls
+    font_name_utf8: [128]u8 = [_]u8{0} ** 128,
+    font_name_utf8_len: u32 = 0,
+    font_generation: u32 = 0,
+
     // OpenType font features for DWrite shaping.
     font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
     font_feature_count: u32 = 0,
@@ -2358,6 +2363,17 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         const dpi_scale: f32 = @as(f32, @floatFromInt(self.dpi)) / 96.0;
         const scaled_size: f32 = point_size * dpi_scale;
 
+        // Early return if font is unchanged - preserve pre-warmed caches
+        if (self.font_face != null and
+            self.base_point_size == point_size and
+            self.font_em_size == scaled_size and
+            features_str.len == 0 and self.font_feature_count == 0 and
+            self.font_name_utf8_len == @as(u32, @intCast(name_utf8.len)) and
+            std.mem.eql(u8, self.font_name_utf8[0..self.font_name_utf8_len], name_utf8))
+        {
+            return; // font unchanged - preserve pre-warmed caches
+        }
+
         const name_w = try utf8ToUtf16Alloc(self.alloc, name_utf8);
         defer self.alloc.free(name_w);
 
@@ -2476,6 +2492,13 @@ pub fn uploadFullAtlasToD3D(self: *Renderer, d3d: anytype) void {
         @memset(&self.font_name, 0);
         const copy_len = @min(name_w.len, self.font_name.len - 1);
         @memcpy(self.font_name[0..copy_len], name_w[0..copy_len]);
+
+        // Update font change tracking (UTF-8 name + generation counter)
+        const utf8_copy_len = @min(name_utf8.len, self.font_name_utf8.len);
+        @memset(&self.font_name_utf8, 0);
+        @memcpy(self.font_name_utf8[0..utf8_copy_len], name_utf8[0..utf8_copy_len]);
+        self.font_name_utf8_len = @intCast(utf8_copy_len);
+        self.font_generation +%= 1;
 
         // Parse and store OpenType features
         self.font_feature_count = 0;
