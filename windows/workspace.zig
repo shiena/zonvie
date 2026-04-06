@@ -142,7 +142,7 @@ pub const WorkspaceState = struct {
         return self.scale <= 0.7;
     }
 
-    // MARK: - System menu (taskbar right-click)
+    // MARK: - Window system menu (title bar icon / Alt+Space)
 
     // Command IDs for system menu items (must not collide with SC_* constants).
     // SC_* values are in the 0xF000+ range; we use 0xE000+.
