@@ -281,6 +281,8 @@ pub fn main() u8 {
     var devcontainer_workspace: ?[]const u8 = null;
     var devcontainer_config: ?[]const u8 = null;
     var devcontainer_rebuild: bool = false;
+    var workspace_name: ?[]const u8 = null;
+    var show_new_session_dialog: bool = false;
     const args = std.process.argsAlloc(alloc) catch return 1;
     defer std.process.argsFree(alloc, args);
 
@@ -541,6 +543,20 @@ pub fn main() u8 {
         }
     }
 
+    {
+        var buf: [512]u8 = undefined;
+        const name_len = c.GetEnvironmentVariableA("ZONVIE_INTERNAL_WORKSPACE_NAME", &buf, buf.len);
+        if (name_len > 0 and name_len < buf.len) {
+            workspace_name = alloc.dupe(u8, buf[0..name_len]) catch null;
+            if (applog.isEnabled()) applog.appLog("[win] internal workspace name detected: {s}\n", .{workspace_name.?});
+        }
+        const dialog_len = c.GetEnvironmentVariableA("ZONVIE_INTERNAL_SHOW_NEW_SESSION_DIALOG", &buf, buf.len);
+        if (dialog_len > 0) {
+            show_new_session_dialog = true;
+            if (applog.isEnabled()) applog.appLog("[win] internal new session dialog requested\n", .{});
+        }
+    }
+
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
         applog.setEnabled(true);
@@ -627,6 +643,8 @@ pub fn main() u8 {
         .devcontainer_rebuild = devcontainer_rebuild,
         .nvim_extra_args = nvim_extra_args,
         .cli_nvim_path = cli_nvim_path,
+        .workspace_name = workspace_name,
+        .show_new_session_dialog = show_new_session_dialog,
     };
 
     // Prevent config.deinit from freeing strings now owned by app
@@ -669,6 +687,9 @@ pub fn main() u8 {
 
     var msg: c.MSG = undefined;
     while (c.GetMessageW(&msg, null, 0, 0) > 0) {
+        if (dialogs.preTranslateMessage(&msg)) {
+            continue;
+        }
         _ = c.TranslateMessage(&msg);
         _ = c.DispatchMessageW(&msg);
     }

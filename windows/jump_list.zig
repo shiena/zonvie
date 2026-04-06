@@ -331,7 +331,7 @@ fn createStartMenuShortcut(exe_path: [*:0]const u16, lnk_path: [*:0]const u16) b
     const link = link_raw.?;
     defer comRelease(link);
 
-    if (!configureShellLink(link, exe_path, null, std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"))) {
+    if (!configureShellLink(link, exe_path, null, std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"), exe_path)) {
         return false;
     }
 
@@ -389,7 +389,13 @@ fn registerJumpList(exe_path: [*:0]const u16) void {
     defer comRelease(coll);
 
     // Add "New Session" task
-    if (createTaskLink(exe_path, null, std.unicode.utf8ToUtf16LeStringLiteral("New Session"))) |link| {
+    var cmd_path_buf: [260]u16 = std.mem.zeroes([260]u16);
+    const cmd_path = buildComSpecPath(&cmd_path_buf) orelse std.unicode.utf8ToUtf16LeStringLiteral("cmd.exe");
+
+    var new_session_args_buf: [1024]u16 = std.mem.zeroes([1024]u16);
+    const new_session_args = buildNewSessionTaskArgs(&new_session_args_buf, exe_path) orelse null;
+
+    if (createTaskLink(cmd_path, new_session_args, std.unicode.utf8ToUtf16LeStringLiteral("New Session"), exe_path)) |link| {
         hr = comVtbl(IObjectCollectionVtbl, coll).AddObject(coll, link);
         if (applog.isEnabled()) applog.appLog("[win] Jump List: AddObject hr=0x{x:0>8}\n", .{@as(u32, @bitCast(hr))});
         comRelease(link);
@@ -419,7 +425,7 @@ fn registerJumpList(exe_path: [*:0]const u16) void {
     }
 }
 
-fn configureShellLink(link: *anyopaque, exe_path: [*:0]const u16, args: ?[*:0]const u16, title: ?[*:0]const u16) bool {
+fn configureShellLink(link: *anyopaque, exe_path: [*:0]const u16, args: ?[*:0]const u16, title: ?[*:0]const u16, icon_path: [*:0]const u16) bool {
     const vtbl = comVtbl(IShellLinkWVtbl, link);
     var hr = vtbl.SetPath(link, exe_path);
     if (hr != S_OK) {
@@ -436,7 +442,7 @@ fn configureShellLink(link: *anyopaque, exe_path: [*:0]const u16, args: ?[*:0]co
     }
 
     _ = vtbl.SetDescription(link, std.unicode.utf8ToUtf16LeStringLiteral("Zonvie - Neovim GUI"));
-    _ = vtbl.SetIconLocation(link, exe_path, 0);
+    _ = vtbl.SetIconLocation(link, icon_path, 0);
 
     if (comQueryInterface(link, &IID_IPropertyStore)) |store| {
         defer comRelease(store);
@@ -470,14 +476,34 @@ fn configureShellLink(link: *anyopaque, exe_path: [*:0]const u16, args: ?[*:0]co
     return false;
 }
 
-fn createTaskLink(exe_path: [*:0]const u16, args: ?[*:0]const u16, title: [*:0]const u16) ?*anyopaque {
+fn createTaskLink(exe_path: [*:0]const u16, args: ?[*:0]const u16, title: [*:0]const u16, icon_path: [*:0]const u16) ?*anyopaque {
     var link_raw: ?*anyopaque = null;
     const hr = CoCreateInstance(&CLSID_ShellLink, null, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, &link_raw);
     if (hr != S_OK or link_raw == null) return null;
     const link = link_raw.?;
-    if (!configureShellLink(link, exe_path, args, title)) {
+    if (!configureShellLink(link, exe_path, args, title, icon_path)) {
         comRelease(link);
         return null;
     }
     return link;
+}
+
+fn buildComSpecPath(buf: []u16) ?[*:0]const u16 {
+    const len = c.GetEnvironmentVariableW(
+        std.unicode.utf8ToUtf16LeStringLiteral("ComSpec"),
+        buf.ptr,
+        @intCast(buf.len),
+    );
+    if (len == 0 or len >= buf.len) return null;
+    buf[len] = 0;
+    return @ptrCast(buf.ptr);
+}
+
+fn buildNewSessionTaskArgs(buf: []u16, exe_path: [*:0]const u16) ?[*:0]const u16 {
+    _ = buildPath(buf, &.{
+        std.unicode.utf8ToUtf16LeStringLiteral("/d /s /c \"set ZONVIE_INTERNAL_SHOW_NEW_SESSION_DIALOG=1 && start \"\" \""),
+        exe_path,
+        std.unicode.utf8ToUtf16LeStringLiteral("\"\""),
+    }) orelse return null;
+    return @ptrCast(buf.ptr);
 }

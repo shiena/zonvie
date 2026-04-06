@@ -2598,6 +2598,11 @@ pub const App = struct {
 
     // CLI --nvim override (points into args allocation, no ownership)
     cli_nvim_path: ?[]const u8 = null,
+    workspace_name: ?[]const u8 = null,
+    show_new_session_dialog: bool = false,
+    session_started: bool = false,
+    session_menu_hwnds: [9]usize = .{0} ** 9,
+    session_menu_count: usize = 0,
 
     // Startup timing: first WM_PAINT with nvim content
     first_paint_logged: bool = false,

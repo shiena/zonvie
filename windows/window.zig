@@ -8,6 +8,8 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
+const workspace_mod = app_mod.workspace_mod;
+const session_registry = @import("session_registry.zig");
 
 // Sub-module imports
 const callbacks = @import("callbacks.zig");
@@ -130,6 +132,112 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 
     // 2) app-root switch (Windows side)
     applog.setEnabled(enabled);
+}
+
+fn syncPrimaryTileConfig(app: *App) void {
+    var config = workspace_mod.ConnectionConfig{};
+    if (app.workspace_name) |name| config.setName(name);
+    if (app.cli_nvim_path) |path| config.setNvimPath(path);
+    if (app.ssh_host) |host| config.setSSHHost(host);
+    if (app.ssh_identity) |identity| config.setSSHIdentity(identity);
+    if (app.ssh_port) |port| config.ssh_port = port;
+    if (app.devcontainer_workspace) |workspace| config.setDevcontainerWorkspace(workspace);
+    if (app.devcontainer_config) |path| config.setDevcontainerConfig(path);
+    config.ext_cmdline = app.ext_cmdline_enabled;
+    config.ext_popupmenu = app.config.popup.external;
+    config.ext_messages = app.ext_messages_enabled;
+    config.ext_tabline = app.ext_tabline_enabled;
+    config.ext_windows = app.ext_windows_enabled;
+    config.devcontainer_rebuild = app.devcontainer_rebuild;
+    app.workspace.setTileConfig(0, config);
+}
+
+fn currentSessionLabel(app: *App, buf: []u8) []const u8 {
+    if (app.workspace.tiles.items.len == 0) return "Session";
+    const tile = &app.workspace.tiles.items[0];
+    if (tile.title_len != 0) return tile.title_buf[0..tile.title_len];
+    return tile.config.displayName(buf);
+}
+
+fn refreshSessionRegistration(app: *App) void {
+    const pid = c.GetCurrentProcessId();
+    if (!app.session_started or app.hwnd == null) {
+        session_registry.removeSession(app.alloc, pid);
+        return;
+    }
+
+    var label_buf: [512]u8 = undefined;
+    const label = currentSessionLabel(app, &label_buf);
+    session_registry.writeCurrentSession(app.alloc, pid, @intFromPtr(app.hwnd.?), label, label);
+}
+
+fn focusRegisteredSession(target_hwnd_value: usize) void {
+    if (target_hwnd_value == 0) return;
+    const target_hwnd: c.HWND = @ptrFromInt(target_hwnd_value);
+    if (c.IsWindow(target_hwnd) == 0) return;
+    if (c.IsIconic(target_hwnd) != 0) {
+        _ = c.ShowWindow(target_hwnd, c.SW_RESTORE);
+    } else {
+        _ = c.ShowWindow(target_hwnd, c.SW_SHOW);
+    }
+    _ = c.BringWindowToTop(target_hwnd);
+    _ = c.SetForegroundWindow(target_hwnd);
+}
+
+fn refreshWorkspaceSystemMenu(app: *App, hwnd: c.HWND) void {
+    const sys_menu = c.GetSystemMenu(hwnd, 0);
+    if (sys_menu == null) return;
+
+    var remaining = app.workspace.system_menu_added_items;
+    while (remaining > 0) : (remaining -= 1) {
+        const count = c.GetMenuItemCount(sys_menu);
+        if (count <= 0) break;
+        _ = c.RemoveMenu(sys_menu, @intCast(count - 1), c.MF_BYPOSITION);
+    }
+    app.workspace.system_menu_added_items = 0;
+    app.session_menu_count = 0;
+    @memset(&app.session_menu_hwnds, 0);
+
+    _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
+    app.workspace.system_menu_added_items += 1;
+    _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_NEW_SESSION, std.unicode.utf8ToUtf16LeStringLiteral("New Session..."));
+    app.workspace.system_menu_added_items += 1;
+
+    var sessions = std.ArrayListUnmanaged(session_registry.SessionInfo){};
+    defer sessions.deinit(app.alloc);
+    session_registry.loadSessions(app.alloc, &sessions);
+
+    if (sessions.items.len != 0) {
+        _ = c.AppendMenuW(sys_menu, c.MF_SEPARATOR, 0, null);
+        app.workspace.system_menu_added_items += 1;
+    }
+
+    for (sessions.items) |session| {
+        if (app.session_menu_count >= app.session_menu_hwnds.len) break;
+        const session_hwnd: c.HWND = @ptrFromInt(session.hwnd);
+        if (c.IsWindow(session_hwnd) == 0) continue;
+
+        var buf: [300]u16 = undefined;
+        var pos: usize = 0;
+        const prefix: []const u8 = if (session.hwnd == @intFromPtr(hwnd)) "* " else "  ";
+        for (prefix) |byte| {
+            if (pos >= buf.len - 1) break;
+            buf[pos] = byte;
+            pos += 1;
+        }
+        for (session.displayLabel()) |byte| {
+            if (pos >= buf.len - 1) break;
+            buf[pos] = byte;
+            pos += 1;
+        }
+        buf[pos] = 0;
+
+        const slot = app.session_menu_count;
+        app.session_menu_hwnds[slot] = session.hwnd;
+        app.session_menu_count += 1;
+        _ = c.AppendMenuW(sys_menu, c.MF_STRING, workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + @as(c_uint, @intCast(slot)), &buf);
+        app.workspace.system_menu_added_items += 1;
+    }
 }
 
 fn launchNewWindow() bool {
@@ -371,8 +479,8 @@ pub export fn WndProc(
                 // Accept file drops via drag & drop
                 c.DragAcceptFiles(hwnd, 1);
 
-                // Initialize workspace system menu items
-                app.workspace.updateSystemMenu(hwnd);
+                syncPrimaryTileConfig(app);
+                refreshWorkspaceSystemMenu(app, hwnd);
 
                 // Post deferred init message - renderer initialization happens after window is shown
                 _ = c.PostMessageW(hwnd, WM_APP_DEFERRED_INIT, 0, 0);
@@ -1995,6 +2103,8 @@ pub export fn WndProc(
                 if (len > 0) {
                     local_buf[len] = 0; // null terminate
                     _ = c.SetWindowTextW(hwnd, &local_buf);
+                    refreshSessionRegistration(app);
+                    refreshWorkspaceSystemMenu(app, hwnd);
                 }
             }
             return 0;
@@ -2104,6 +2214,12 @@ pub export fn WndProc(
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
+                                if (start_ok != 0) {
+                                    app.session_started = true;
+                                    app.workspace.setTileStarted(0, true);
+                                    refreshSessionRegistration(app);
+                                    refreshWorkspaceSystemMenu(app, hwnd);
+                                }
                             }
 
                             // Hide progress dialog
@@ -2446,8 +2562,9 @@ pub export fn WndProc(
                     }
                 }
 
-                // Skip nvim startup if waiting for devcontainer up
-                if (!app.devcontainer_up_pending) {
+                // Skip nvim startup if waiting for devcontainer up or when this window
+                // is acting only as the launcher for the session overview/dialog flow.
+                if (!app.devcontainer_up_pending and !app.show_new_session_dialog) {
                     const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                     defer if (nvim_path_z) |p| app.alloc.free(p);
                     const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
@@ -2460,13 +2577,19 @@ pub export fn WndProc(
                         applog.appLog("  [TIMING] zonvie_core_start: {d}ms (nvim spawn running in background)", .{core_start_ms});
                         applog.appLog("  core_start -> {d}", .{start_ok});
                     }
+                    if (start_ok != 0) {
+                        app.session_started = true;
+                        app.workspace.setTileStarted(0, true);
+                        refreshSessionRegistration(app);
+                        refreshWorkspaceSystemMenu(app, hwnd);
+                    }
 
                     // Close devcontainer progress dialog if shown (for non-rebuild mode)
                     if (app.devcontainer_mode and !app.devcontainer_rebuild) {
                         dialogs.hideDevcontainerProgressDialog();
                     }
                 } else {
-                    if (deferred_log_enabled) applog.appLog("[win] nvim startup skipped, waiting for devcontainer up\n", .{});
+                    if (deferred_log_enabled) applog.appLog("[win] nvim startup skipped, waiting for devcontainer up or session dialog\n", .{});
                 }
 
                 // ============================================================
@@ -2568,6 +2691,11 @@ pub export fn WndProc(
                     _ = c.QueryPerformanceCounter(&t2);
                     const total_ms = @divTrunc((t2.QuadPart - t0.QuadPart) * 1000, freq.QuadPart);
                     applog.appLog("[win] WM_APP_DEFERRED_INIT: end (total {d}ms)", .{total_ms});
+                }
+
+                if (app.show_new_session_dialog) {
+                    dialogs.showSessionOverview(app, hwnd);
+                    dialogs.showConnectionDialog(app, hwnd);
                 }
 
                 // Force a repaint now that renderer is ready
@@ -3598,17 +3726,20 @@ pub export fn WndProc(
         c.WM_SYSCOMMAND => {
             const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
             if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
-                const launched = launchNewWindow();
-                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: New Session requested launched={}\n", .{launched});
+                if (getApp(hwnd)) |app| {
+                    dialogs.showSessionOverview(app, hwnd);
+                    dialogs.showConnectionDialog(app, hwnd);
+                }
                 return 0;
             }
             if (cmd >= app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE and
                 cmd < app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE + 9)
             {
-                const index: u8 = @intCast(cmd - app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE);
-                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: Switch to session {d}\n", .{index});
                 if (getApp(hwnd)) |app| {
-                    app.workspace.switchToTile(index);
+                    const index: usize = @intCast(cmd - app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE);
+                    if (index < app.session_menu_count) {
+                        focusRegisteredSession(app.session_menu_hwnds[index]);
+                    }
                 }
                 return 0;
             }
@@ -3664,6 +3795,7 @@ pub export fn WndProc(
         c.WM_DESTROY => {
             // Remove tray icon before quitting
             if (getApp(hwnd)) |app| {
+                session_registry.removeSession(app.alloc, c.GetCurrentProcessId());
                 if (app.tray_icon) |*tray| {
                     tray.remove();
                 }
