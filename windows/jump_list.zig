@@ -155,9 +155,10 @@ const ICustomDestinationListVtbl = extern struct {
     AppendCategory: *const anyopaque,
     AppendKnownCategory: *const anyopaque,
     AddUserTasks: *const fn (*anyopaque, *anyopaque) callconv(.winapi) HRESULT,
+    CommitList: *const fn (*anyopaque) callconv(.winapi) HRESULT,
+    GetRemovedDestinations: *const anyopaque,
     DeleteList: *const fn (*anyopaque, ?[*:0]const u16) callconv(.winapi) HRESULT,
     AbortList: *const fn (*anyopaque) callconv(.winapi) HRESULT,
-    CommitList: *const fn (*anyopaque) callconv(.winapi) HRESULT,
 };
 
 const IPersistFileVtbl = extern struct {
@@ -278,34 +279,35 @@ pub fn initJumpList() void {
     if (buildAppdataPath(&marker_buf, std.unicode.utf8ToUtf16LeStringLiteral("\\zonvie\\.jumplist_declined")) == null) return;
     const marker_path: [*:0]const u16 = @ptrCast(&marker_buf);
 
-    if (fileExists(marker_path)) {
-        if (applog.isEnabled()) applog.appLog("[win] Jump List: user previously declined\n", .{});
-        return;
-    }
-
     if (!fileExists(lnk_path)) {
-        // Ask user to create a Start Menu shortcut for Jump List registration
-        const result = c.MessageBoxW(
-            null,
-            std.unicode.utf8ToUtf16LeStringLiteral(
-                "Zonvie can add items to the taskbar right-click menu.\r\n\r\n" ++
-                    "This requires creating a Start Menu shortcut for the app.\r\n\r\n" ++
-                    "Create the shortcut now?",
-            ),
-            std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"),
-            c.MB_YESNO | c.MB_ICONQUESTION,
-        );
-
-        if (result != c.IDYES) {
-            touchFile(marker_path);
-            return;
-        }
-
         if (createStartMenuShortcut(exe_path, lnk_path)) {
             if (applog.isEnabled()) applog.appLog("[win] Jump List: shortcut created\n", .{});
         } else {
-            if (applog.isEnabled()) applog.appLog("[win] Jump List: failed to create shortcut\n", .{});
-            return;
+            if (fileExists(marker_path)) {
+                if (applog.isEnabled()) applog.appLog("[win] Jump List: shortcut missing and user previously declined\n", .{});
+                return;
+            }
+
+            const result = c.MessageBoxW(
+                null,
+                std.unicode.utf8ToUtf16LeStringLiteral(
+                    "Zonvie can add items to the taskbar right-click menu.\r\n\r\n" ++
+                        "This requires creating a Start Menu shortcut for the app.\r\n\r\n" ++
+                        "Create the shortcut now?",
+                ),
+                std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"),
+                c.MB_YESNO | c.MB_ICONQUESTION,
+            );
+
+            if (result != c.IDYES) {
+                touchFile(marker_path);
+                return;
+            }
+
+            if (!createStartMenuShortcut(exe_path, lnk_path)) {
+                if (applog.isEnabled()) applog.appLog("[win] Jump List: failed to create shortcut after confirmation\n", .{});
+                return;
+            }
         }
     } else if (!createStartMenuShortcut(exe_path, lnk_path)) {
         if (applog.isEnabled()) applog.appLog("[win] Jump List: failed to refresh shortcut\n", .{});

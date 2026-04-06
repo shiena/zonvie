@@ -132,6 +132,40 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
     applog.setEnabled(enabled);
 }
 
+fn launchNewWindow() bool {
+    var exe_path_buf: [260]u16 = std.mem.zeroes([260]u16);
+    const exe_len = c.GetModuleFileNameW(null, &exe_path_buf, exe_path_buf.len);
+    if (exe_len == 0 or exe_len >= exe_path_buf.len) {
+        if (applog.isEnabled()) applog.appLog("[win] launchNewWindow: GetModuleFileNameW failed\n", .{});
+        return false;
+    }
+
+    var si: c.STARTUPINFOW = std.mem.zeroes(c.STARTUPINFOW);
+    si.cb = @sizeOf(c.STARTUPINFOW);
+    var pi: c.PROCESS_INFORMATION = std.mem.zeroes(c.PROCESS_INFORMATION);
+
+    const create_ok = c.CreateProcessW(
+        @ptrCast(&exe_path_buf),
+        null,
+        null,
+        null,
+        0,
+        0,
+        null,
+        null,
+        &si,
+        &pi,
+    );
+    if (create_ok == 0) {
+        if (applog.isEnabled()) applog.appLog("[win] launchNewWindow: CreateProcessW failed, gle={d}\n", .{c.GetLastError()});
+        return false;
+    }
+
+    _ = c.CloseHandle(pi.hProcess);
+    _ = c.CloseHandle(pi.hThread);
+    return true;
+}
+
 pub export fn WndProc(
     hwnd: c.HWND,
     msg: c.UINT,
@@ -3564,8 +3598,8 @@ pub export fn WndProc(
         c.WM_SYSCOMMAND => {
             const cmd = @as(c_uint, @intCast(wParam & 0xFFF0));
             if (cmd == app_mod.workspace_mod.WorkspaceState.SC_WS_NEW_SESSION) {
-                // TODO: Phase 2 — open connection dialog for new workspace tile
-                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: New Session requested\n", .{});
+                const launched = launchNewWindow();
+                if (applog.isEnabled()) applog.appLog("[win] WM_SYSCOMMAND: New Session requested launched={}\n", .{launched});
                 return 0;
             }
             if (cmd >= app_mod.workspace_mod.WorkspaceState.SC_WS_SESSION_BASE and
