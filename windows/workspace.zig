@@ -11,6 +11,7 @@
 const std = @import("std");
 const c = @import("win32.zig").c;
 const core = @import("zonvie_core");
+const d3d11 = @import("renderer/d3d11_renderer.zig");
 
 pub const zonvie_core = core.zonvie_core;
 
@@ -137,9 +138,8 @@ pub const Tile = struct {
     title_buf: [256]u8 = .{0} ** 256,
     title_len: usize = 0,
 
-    // Snapshot texture for tile thumbnail display
-    // (ID3D11Texture2D, opaque to avoid d3d11 dependency here)
-    snapshot_texture: ?*anyopaque = null,
+    // Snapshot of tile content for workspace overlay thumbnail display
+    snapshot: ?d3d11.Renderer.SnapshotTexture = null,
 
     pub fn isOccupied(self: *const Tile) bool {
         return self.corep != null and self.started;
@@ -168,6 +168,10 @@ pub const WorkspaceState = struct {
         // because it needs to happen in the correct order relative to
         // renderer/atlas cleanup.
         for (self.tiles.items) |*tile| {
+            if (tile.snapshot) |*snap| {
+                d3d11.Renderer.releaseSnapshot(snap);
+                tile.snapshot = null;
+            }
             if (tile.ctx) |ctx_ptr| {
                 const typed: *TileContext = @ptrCast(@alignCast(ctx_ptr));
                 self.alloc.destroy(typed);

@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
 const workspace_mod = app_mod.workspace_mod;
 const session_registry = @import("session_registry.zig");
+const workspace_overlay = @import("workspace_overlay.zig");
 
 // Sub-module imports
 const callbacks = @import("callbacks.zig");
@@ -1463,12 +1464,17 @@ pub export fn WndProc(
                             // content shift. Adding pScrollRect/pScrollOffset to Present1 would
                             // cause a double-shift since we CopySubresourceRegion back_tex→bb.
 
+                            // Draw workspace overlay if visible
+                            if (app.workspace.isOverviewVisible()) {
+                                workspace_overlay.draw(g, &app.workspace, g.width, g.height);
+                            }
+
                             if (g.presentFromBackRectsWithCursorNoResize(
                                 present_rects_slice,
                                 app.cursor_vb,
                                 cursor_verts_snapshot.len,
                                 cursor_rc_opt,
-                                force_full_present,
+                                force_full_present or app.workspace.isOverviewVisible(),
                                 null,
                                 null,
                             )) {
@@ -2709,6 +2715,9 @@ pub export fn WndProc(
                 const vk: u32 = @intCast(wParam);
                 const mods = input.queryMods();
 
+                // Workspace overlay shortcuts (before core input)
+                if (handleWorkspaceKey(app, hwnd, vk, mods)) return 0;
+
                 // Windows keycode is passed as 0x10000|VK so Zig core can distinguish.
                 const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
 
@@ -3944,4 +3953,70 @@ pub export fn WndProc(
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ============================================================
+// Workspace overlay keyboard handling
+// ============================================================
+
+/// Handle workspace overlay keyboard shortcuts.
+/// Returns true if the key was consumed (caller should return 0).
+fn handleWorkspaceKey(app: *App, hwnd: c.HWND, vk: u32, mods: u32) bool {
+    const ctrl_only = (mods & input.MOD_CTRL) != 0 and (mods & (input.MOD_ALT | input.MOD_SHIFT)) == 0;
+
+    // Ctrl+` (VK_OEM_3 = backtick/tilde key): toggle workspace overview
+    if (ctrl_only and vk == c.VK_OEM_3) {
+        if (app.workspace.scale >= 1.0) {
+            // Enter overview: capture snapshot of active tile first
+            if (app.renderer) |*renderer| {
+                renderer.lockContext();
+                defer renderer.unlockContext();
+                if (renderer.captureSnapshot()) |snap| {
+                    var tile = app.workspace.activeTile();
+                    if (tile.snapshot) |*old| {
+                        d3d11.Renderer.releaseSnapshot(old);
+                    }
+                    tile.snapshot = snap;
+                } else |_| {}
+            }
+            app.workspace.scale = 0.0;
+        } else {
+            app.workspace.scale = 1.0;
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return true;
+    }
+
+    // When overview is visible, intercept keys
+    if (app.workspace.isOverviewVisible()) {
+        // Escape: close overview
+        if (vk == c.VK_ESCAPE) {
+            app.workspace.scale = 1.0;
+            _ = c.InvalidateRect(hwnd, null, 0);
+            return true;
+        }
+
+        // Number keys 1-9: select tile by index
+        if (vk >= '1' and vk <= '9') {
+            const index: u8 = @intCast(vk - '1');
+            if (index < app.workspace.tiles.items.len) {
+                app.workspace.switchToTile(index);
+                app.workspace.scale = 1.0;
+                _ = c.InvalidateRect(hwnd, null, 0);
+            }
+            return true;
+        }
+
+        // Enter: activate selected tile and close overview
+        if (vk == c.VK_RETURN) {
+            app.workspace.scale = 1.0;
+            _ = c.InvalidateRect(hwnd, null, 0);
+            return true;
+        }
+
+        // Consume all other keys while overview is visible
+        return true;
+    }
+
+    return false;
 }
