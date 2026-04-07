@@ -38,6 +38,9 @@ final class ZonvieCore {
     static var appLogEnabled = false
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
+    /// Process start time captured at first appLog reference; used to prefix
+    /// log lines with elapsed milliseconds for startup latency diagnostics.
+    private static let appLogStartNs: UInt64 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
 
     // Notification posted when Neovim is ready (first vertices received)
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
@@ -50,6 +53,13 @@ final class ZonvieCore {
     private var quitTimeoutWorkItem: DispatchWorkItem?
     private var quitTimeoutFired: Bool = false  // Ignore delayed responses after timeout
     private static let quitTimeoutSeconds: Double = 5.0
+
+    // First-occurrence flags for startup latency diagnostics. Each is set
+    // once and only used to gate a single appLog call, so they have no
+    // effect on steady-state hot paths.
+    private var loggedFirstRedrawEvent: Bool = false
+    private var loggedFirstFlushBegin: Bool = false
+    private var loggedFirstFlushEnd: Bool = false
 
     // Frontend input trace state used to correlate sendInput -> draw timing.
     private let inputTraceLock = NSLock()
@@ -75,7 +85,11 @@ final class ZonvieCore {
 
     static func appLog(_ message: @autoclosure () -> String) {
         if !appLogEnabled { return }
-        let line = "[zonvie] \(message())\n"
+        // Prefix with elapsed milliseconds since process start for startup
+        // latency diagnostics. Resolution is sub-millisecond on Apple Silicon.
+        let nowNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let elapsedMs = Double(nowNs &- appLogStartNs) / 1_000_000.0
+        let line = String(format: "[zonvie] [%9.3fms] %@\n", elapsedMs, message())
 
         if let handle = logFileHandle {
             if let data = line.data(using: .utf8) {
@@ -581,6 +595,10 @@ final class ZonvieCore {
             on_flush_begin: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                if ZonvieCore.appLogEnabled, !me.loggedFirstFlushBegin {
+                    me.loggedFirstFlushBegin = true
+                    ZonvieCore.appLog("[startup] first on_flush_begin")
+                }
                 let result = me.terminalView?.renderer.beginFlush() ?? .dropped
                 guard let corePtr = me.core else { return }
 
@@ -619,6 +637,10 @@ final class ZonvieCore {
             on_flush_end: { ctx in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                if ZonvieCore.appLogEnabled, !me.loggedFirstFlushEnd {
+                    me.loggedFirstFlushEnd = true
+                    ZonvieCore.appLog("[startup] first on_flush_end")
+                }
                 // Read drawable size from core while grid_mu is still held.
                 // These values match exactly what the flush used for NDC computation.
                 var dw: UInt32 = 0

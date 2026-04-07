@@ -436,6 +436,18 @@ pub const Core = struct {
 
     last_layout_rows: u32 = 0,
     last_layout_cols: u32 = 0,
+    /// Pending resize dimensions stashed when the frontend calls resize()
+    /// before nvim_ui_attach (or when the writer pipe is not yet ready).
+    ///
+    /// pending_resize_mu also serializes the *transition* from "pre-attach"
+    /// to "attached" with respect to resize() callers. Both the
+    /// `pending_resize_*` fields AND the read/write of `ui_attached` that
+    /// gates this branch MUST be performed while holding this mutex,
+    /// otherwise a resize() call can observe ui_attached==false, get
+    /// preempted before writing pending_*, and lose its update to a
+    /// concurrent rpc_session that has already finished consuming pending_*
+    /// and flipped ui_attached to true.
+    pending_resize_mu: std.Thread.Mutex = .{},
     pending_resize_rows: u32 = 0,
     pending_resize_cols: u32 = 0,
     pending_resize_valid: bool = false,
@@ -1478,10 +1490,34 @@ pub const Core = struct {
     }
 
     pub fn resize(self: *Core, rows: u32, cols: u32) void {
-        self.requestTryResize(rows, cols) catch |e| {
+        // Before ui_attach completes the writer pipe is not ready and stdin
+        // may not yet accept data. Stash the request so the session startup
+        // path can fold it into ui_attach (or send it immediately after.)
+        //
+        // Read ui_attached UNDER pending_resize_mu so the rpc_session startup
+        // sequence (which flips ui_attached while holding the same lock) and
+        // this branch see a consistent (ui_attached, pending_*) tuple. Doing
+        // a lock-free atomic load here would let an interleaving lose this
+        // resize entirely:
+        //   T_ui : sees ui_attached==false
+        //   T_rpc: snapshots pending (empty), sets ui_attached=true, no send
+        //   T_ui : writes pending_*=valid, returns -- never delivered
+        self.pending_resize_mu.lock();
+        if (!self.ui_attached.load(.seq_cst)) {
             self.pending_resize_rows = rows;
             self.pending_resize_cols = cols;
             self.pending_resize_valid = true;
+            self.pending_resize_mu.unlock();
+            return;
+        }
+        self.pending_resize_mu.unlock();
+
+        self.requestTryResize(rows, cols) catch |e| {
+            self.pending_resize_mu.lock();
+            self.pending_resize_rows = rows;
+            self.pending_resize_cols = cols;
+            self.pending_resize_valid = true;
+            self.pending_resize_mu.unlock();
             self.log.write(
                 "resize err: {any} -> pending_resize rows={d} cols={d}\n",
                 .{ e, rows, cols },
@@ -1489,9 +1525,13 @@ pub const Core = struct {
             return;
         };
 
+        // Successful send: clear any pending entry that matches what we just sent
+        // so we don't double-send the same dimensions later.
+        self.pending_resize_mu.lock();
         if (self.pending_resize_valid and self.pending_resize_rows == rows and self.pending_resize_cols == cols) {
             self.pending_resize_valid = false;
         }
+        self.pending_resize_mu.unlock();
     }
 
     pub fn updateLayoutPx(

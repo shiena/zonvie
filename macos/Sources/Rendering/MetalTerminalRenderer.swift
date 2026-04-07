@@ -420,7 +420,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let initialSize = ZonvieConfig.shared.font.size > 0 ? ZonvieConfig.shared.font.size : 14.0
         ZonvieCore.appLog("[Renderer] init: initial font='\(initialFont)' size=\(initialSize)")
 
-        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize))
+        // Pull configured atlas size up-front so the GlyphAtlas allocates its
+        // texture at the correct dimensions immediately, avoiding a wasteful
+        // recreate when core.start() later calls setAtlasSize() during nvim
+        // bring-up. Clamp lower bound to 1024 to match Config validation.
+        let configuredAtlasSize = max(1024, ZonvieConfig.shared.performance.atlasSize)
+        self.atlas = GlyphAtlas(device: dev, fontName: initialFont, pointSize: CGFloat(initialSize), atlasSize: configuredAtlasSize)
         self.blurEnabled = ZonvieConfig.shared.blurEnabled
 
         super.init()
@@ -1754,6 +1759,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             var t_present_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
                 t_present_start = CFAbsoluteTimeGetCurrent()
+                if !hasPresentedOnce {
+                    ZonvieCore.appLog("[startup] first present scheduled (cmd.present called)")
+                }
             }
             cmd.present(drawable)
             // Capture semaphore and lock directly so the signal fires even
@@ -1770,6 +1778,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 guard let self = self else { return }
                 let wasFirstPresent = !self.hasPresentedOnce
                 self.hasPresentedOnce = true
+                if ZonvieCore.appLogEnabled, wasFirstPresent {
+                    ZonvieCore.appLog("[startup] first present completed (GPU done)")
+                }
 
                 // Force shadow recalculation on first present when blur is enabled
                 // Transparent windows (isOpaque=false, backgroundColor=.clear) need this

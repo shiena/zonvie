@@ -1276,31 +1276,90 @@ pub fn runLoop(self: *Core) void {
 
     self.requestGetApiInfo() catch |e| self.log.write("send get_api_info failed: {any}\n", .{e});
     self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
-    self.requestUiAttach(self.init_rows, self.init_cols) catch |e| {
+
+    // If the frontend already requested a resize before the writer pipe was
+    // ready, fold those dimensions into the initial ui_attach so we don't
+    // pay an extra try_resize round-trip (and an extra grid_resize event).
+    //
+    // The frontend may call resize() concurrently on a UI thread (e.g. macOS
+    // dispatches start() to a background queue while the main thread is
+    // still settling its window layout), so all access to pending_resize_*
+    // must hold pending_resize_mu. We snapshot under the lock and consume
+    // the entry only if we use it.
+    var attach_rows = self.init_rows;
+    var attach_cols = self.init_cols;
+    {
+        self.pending_resize_mu.lock();
+        defer self.pending_resize_mu.unlock();
+        if (self.pending_resize_valid) {
+            attach_rows = self.pending_resize_rows;
+            attach_cols = self.pending_resize_cols;
+            self.pending_resize_valid = false;
+            self.log.write("ui_attach using pending resize rows={d} cols={d}\n", .{ attach_rows, attach_cols });
+        }
+    }
+
+    self.requestUiAttach(attach_rows, attach_cols) catch |e| {
         self.log.write("ui_attach send failed: {any}\n", .{e});
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return;
     };
+
+    // Atomically transition into "attached" state and snapshot any
+    // post-attach pending resize that raced in. Setting ui_attached
+    // and reading pending_resize_* must happen under the same lock
+    // that resize() observes, otherwise a UI-thread resize() that
+    // saw ui_attached==false moments earlier could write its pending_*
+    // AFTER we've already finished snapshotting, and nobody would
+    // ever send it.
+    var pending_to_send_valid: bool = false;
+    var pending_to_send_rows: u32 = 0;
+    var pending_to_send_cols: u32 = 0;
+    {
+        self.pending_resize_mu.lock();
+        defer self.pending_resize_mu.unlock();
+        if (self.pending_resize_valid) {
+            pending_to_send_valid = true;
+            pending_to_send_rows = self.pending_resize_rows;
+            pending_to_send_cols = self.pending_resize_cols;
+        }
+        // Flip ui_attached UNDER the lock so any resize() racing with us
+        // either:
+        //   (a) acquired the lock first, observed ui_attached==false, and
+        //       wrote pending_* (which we just snapshotted above), or
+        //   (b) acquires the lock after this point, observes
+        //       ui_attached==true, and goes through the normal send path.
+        // No interleaving can sneak a write into pending_* without us
+        // snapshotting it.
+        self.ui_attached.store(true, .seq_cst);
+    }
     ui_attached = true;
-    self.ui_attached.store(true, .seq_cst);
     self.flushPendingFocus();
-    self.requestTryResize(self.init_rows, self.init_cols) catch |e| self.log.write("try_resize send failed: {any}\n", .{e});
     self.requestCommand("redraw!") catch |e| self.log.write("redraw! send failed: {any}\n", .{e});
 
     // Glow config is requested via glow_startup_retries during flush processing.
     // -c commands may not have run yet at this point.
 
-    if (self.pending_resize_valid) {
-        const pr = self.pending_resize_rows;
-        const pc = self.pending_resize_cols;
+    if (pending_to_send_valid) {
+        const pr = pending_to_send_rows;
+        const pc = pending_to_send_cols;
         var pending_sent = true;
         self.requestTryResize(pr, pc) catch |e| {
             self.log.write("pending resize send failed: {any}\n", .{e});
             pending_sent = false;
         };
         if (pending_sent) {
-            self.pending_resize_valid = false;
+            self.pending_resize_mu.lock();
+            // Only clear if no newer resize arrived in the meantime that
+            // we'd otherwise drop.
+            if (self.pending_resize_valid and
+                self.pending_resize_rows == pr and
+                self.pending_resize_cols == pc)
+            {
+                self.pending_resize_valid = false;
+            }
+            self.pending_resize_mu.unlock();
             self.log.write("pending resize sent rows={d} cols={d}\n", .{ pr, pc });
         }
     }

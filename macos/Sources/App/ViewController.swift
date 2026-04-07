@@ -97,12 +97,40 @@ final class ViewController: NSViewController {
             core.setExtMessages(true)
         }
 
-        // Delay start to ensure RunLoop is running (needed for SSH password dialog)
+        // Dispatch core.start() off the main thread so viewDidLoad can return
+        // immediately and AppDelegate.makeKeyAndOrderFront runs without waiting
+        // for nvim spawn / Zig core init. nvim startup then proceeds in
+        // parallel with the AppKit window-shown work on main, shaving ~80ms
+        // off perceived window-appear latency.
+        //
+        // Safety: callbacks (assigned during ZonvieCore.init) and the
+        // terminalView <-> core wiring above are already in place, so any
+        // RPC-thread callbacks that fire during/after start() find a fully
+        // connected core. start() itself only touches the Zig core and
+        // SSH/devcontainer paths self-dispatch to main internally.
+        //
+        // SSH/devcontainer modes still use main.async because their auth
+        // dialogs require a running main RunLoop and they perform AppKit work
+        // (NSWindow, osascript) inside start().
         let nvimPath = cliNvimPath ?? config.neovim.path
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            // rows/cols initial is decided by Zig core; current bootstrap uses 1x1.
-            _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+        // SSH/devcontainer can be enabled either via CLI flag (parsed in
+        // main.swift) OR via config.toml (config.neovim.ssh). ZonvieCore.start()
+        // makes the same combined check at macos/Sources/Core/ZonvieCore.swift
+        // SSH branch (config-fallback for sshHost). Mirror that here so a
+        // config-driven SSH startup also stays on the main queue, where its
+        // SSH_ASKPASS dialog and AppKit setup can run safely.
+        let sshEnabled = sshModeEnabled || config.neovim.ssh
+        if sshEnabled || devcontainerModeEnabled {
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            }
+        } else {
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                // rows/cols initial is decided by Zig core; current bootstrap uses 1x1.
+                _ = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            }
         }
     }
 
